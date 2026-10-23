@@ -621,12 +621,13 @@ class StylerWindow(Gtk.ApplicationWindow):
             dd = Gtk.DropDown.new_from_strings([notes.get(ch, ch) for ch in choices])
             dd.choices = choices
             dd.set_hexpand(True)
-            if len(choices) > 15:
+            if len(choices) > 15 or key == "theme":
                 dd.set_enable_search(True)
                 dd.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
             dd.connect("notify::selected", self.on_changed, key)
             self.dropdowns[key] = dd
-            if len(choices) > 6:
+            stepped = len(choices) > 6 or key == "theme"
+            if stepped:
                 # Step through long lists without reopening the dropdown each time.
                 step = Gtk.Box(css_classes=["linked"])
                 step.append(dd)
@@ -638,7 +639,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             else:
                 grid.attach(dd, 1, row, 1, 1)
             if in_prompt:
-                self.prompt_widgets += [name_label, step if len(choices) > 6 else dd]
+                self.prompt_widgets += [name_label, step if stepped else dd]
             row += 1
             if key == "theme":
                 self.theme_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, selectable=True)
@@ -1028,7 +1029,9 @@ def prompt_block(p):
         disabled("p_os"),
         toml_kv("format", seg("$symbol", p["p_os_color"])),
         "[os.symbols]",
-        *(toml_kv(name, icon) for name, icon in OS_SYMBOLS.items()),
+        # Only this machine's OS: starship drops the whole module on a name it doesn't know,
+        # and older versions lack some.
+        *(toml_kv(name, OS_SYMBOLS[name]) for name in dict.fromkeys(["Linux", detect_os()])),
         "",
         "[username]",
         f"disabled = {str(not user_on).lower()}",
