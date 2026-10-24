@@ -1,8 +1,8 @@
 # Kitty Styler
 
 A small GTK4 app for picking how the [kitty](https://sw.kovidgoyal.net/kitty/) terminal looks: theme, font,
-opacity, padding, cursor, line height, tab bar and, optionally, a [starship](https://starship.rs/) prompt
-and your zsh shell (oh-my-zsh plugins, typing colours, behaviour).
+opacity, padding, cursor, line height, tab bar, your prompt (your own, or a [starship](https://starship.rs/)
+prompt styled here) and, with zsh, the shell itself (oh-my-zsh plugins, typing colours, behaviour).
 Every change shows up in a live preview before anything is written.
 
 ![Kitty Styler with the Noctalia theme and a styled starship prompt](docs/screenshot.png)
@@ -13,10 +13,14 @@ Every change shows up in a live preview before anything is written.
 - **Kitty settings**: font, size, background opacity, window padding, cursor shape, blink and trail, line
   height, letter spacing, and tab bar position, alignment and style.
 - **Live preview**: a mock terminal with a prompt, `ls`, a diff, an error, all 16 colours and the tab bar,
-  drawn on your wallpaper when it can find one, so opacity is visible.
-- **Starship prompt (optional)**: segment styles (plain, bubbles, arrows, slanted, blocks), one or two
-  lines, and per-part colours for the OS icon, user and host, folder, git, error code, duration,
-  language versions and clock. Off by default.
+  drawn on your wallpaper when it can find one, so opacity is visible. The prompt is your real one: the
+  app asks your shell (or starship) to draw it in the background, so Powerlevel10k, oh-my-zsh themes,
+  fish and bash prompts show as they really look, including the error state.
+- **Prompt**: keep your own prompt, switch the shell to starship with your own `starship.toml`, or style
+  starship here: segment styles (plain, bubbles, arrows, slanted, blocks), one or two lines, and per-part
+  colours for the OS icon, user and host, folder, git, error code, duration, language versions and clock.
+- **Works with the shell kitty starts**: kitty's `shell` setting, else your login shell. zsh, fish and
+  bash are supported; the app edits that shell's own config file.
 - **Shell (zsh, optional)**: tick [oh-my-zsh](https://ohmyz.sh/) plugins from a searchable list that
   shows what each one does and the aliases it adds; pick the colours
   [zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting) and
@@ -36,11 +40,18 @@ Every change shows up in a live preview before anything is written.
   block. Pick "Keep current theme" to drop it and go back to your own colours.
 - **Backups**: before each Apply, kitty.conf is copied to `kitty.conf.bak-<date>-<time>`. The newest 5 are
   kept.
-- **starship.toml**: untouched unless you turn on "Style the prompt". Then Apply writes a block between
+- **starship.toml**: untouched unless you pick "Starship, styled here". Then Apply writes a block between
   `# >>> KITTY STYLER PROMPT >>>` markers and makes a one-time backup, `starship.toml.bak-kitty-styler`.
   If your own config already sets the same things (for example a top-level `format` or a `[directory]`
-  table), nothing is written and the window says why. Turning the switch off and applying removes the
+  table), nothing is written and the window says why. Picking another prompt and applying removes the
   block again. Your prompt settings stay saved in one comment line.
+- **Shell config (.zshrc, config.fish or .bashrc)**: untouched while you keep your own prompt. If your
+  shell doesn't start starship yet and you pick a starship prompt, Apply adds a block between
+  `# >>> KITTY STYLER PROMPT SWITCH >>>` markers at the end that starts starship. For zsh, a second block
+  at the top turns off Powerlevel10k's instant prompt. A one-time `.bak-kitty-styler` backup is made and
+  the result is syntax-checked first. Picking your own prompt again removes the blocks, so the file is
+  as it was. The blocks skip themselves when `KITTY_STYLER_BASE_PROMPT` is set; the preview uses that to
+  draw your own prompt.
 
 - **.zshrc**: untouched while every shell option is "Leave as is" and the plugin list is unchanged.
   Otherwise Apply writes the plugin list between `# >>> KITTY STYLER ZSH PLUGINS >>>` markers just before
@@ -57,6 +68,7 @@ Symlinked config files (from a dotfile manager) are written through the link.
   `python3-gi python3-gi-cairo gir1.2-gtk-4.0`)
 - fontconfig (`fc-list`), for the font list
 - kitty
+- zsh, fish or bash
 - Optional: zsh with oh-my-zsh, zsh-syntax-highlighting and zsh-autosuggestions
 - Optional: starship, and a [Nerd Font](https://www.nerdfonts.com/) for the prompt icons
 
@@ -100,13 +112,18 @@ config:
 | `KITTY_STYLER_NOCTALIA` | `~/.local/state/noctalia/settings.toml` |
 | `KITTY_STYLER_THEMES` | `~/.cache/kitty/kitty-themes.zip` |
 | `KITTY_STYLER_ZSHRC` | `$ZDOTDIR/.zshrc`, else `~/.zshrc` |
+| `KITTY_STYLER_FISHRC` | `$XDG_CONFIG_HOME/fish/config.fish`, else `~/.config/fish/config.fish` |
+| `KITTY_STYLER_BASHRC` | `~/.bashrc` |
+| `KITTY_STYLER_SHELL` | the shell kitty starts (`zsh`, `fish` or `bash`) |
 
-Apply still sends a reload signal to every running kitty.
+Apply still sends a reload signal to every running kitty. The prompt preview runs your real shell and
+reads its real config; it never writes to it.
 
 ## Tested on
 
 CachyOS with Hyprland, kitty, starship 1.26, Noctalia and zsh 5.9 with CachyOS's oh-my-zsh setup, plus test setups without Noctalia and without a
-kitty config.
+kitty config. Prompt preview and switching tested with Powerlevel10k (one- and two-line presets),
+CachyOS's fish 4.9 prompt and bash. fish's Tide prompt is not tested.
 
 ## License
 

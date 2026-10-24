@@ -3,10 +3,14 @@
 import glob
 import json
 import os
+import pwd
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import tomllib
 import warnings
@@ -223,13 +227,14 @@ ZSH_OPTIONS += [
     ("Terminal beep", "z_beep", list(ON_OFF), ON_OFF, None),
 ]
 ZSH_KEYS = [o for o in ZSH_OPTIONS if o[1]]
-TOP_HEADINGS = ("Prompt (starship)", "Shell (zsh)")
+TOP_HEADINGS = ("Prompt", "Shell (zsh)")
 # Commands the preview shows as not found.
 PREVIEW_UNKNOWN = {"sl"}
 CHOICE_NOTES = {"cursor_blink_interval": {"-1": "-1 (system default)", "0": "0 (no blink)"},
                 "cursor_trail": {"0": "0 (off)"}}
 CHOICE_NOTES.update({key: names for _l, key, _c, _d, names in PROMPT_KEYS if names})
 CHOICE_NOTES.update({key: names for _l, key, _c, names, _n in ZSH_KEYS})
+CHOICE_NOTES["prompt_mode"] = {}
 CSS = """
 .plugin-card { background: alpha(@theme_fg_color, 0.07); border: 1px solid alpha(@theme_fg_color, 0.3);
                border-radius: 8px; padding: 8px 10px; margin: 4px 8px; }
@@ -357,6 +362,393 @@ def hex_rgb(h):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+# ---- The shell kitty runs, its prompt, and switching it to starship ----
+# Each shell's config file; the env variables point tests at scratch copies.
+SHELL_RC = {
+    "zsh": ZSHRC,
+    "fish": os.path.expanduser(os.environ.get("KITTY_STYLER_FISHRC", os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", "~/.config"), "fish", "config.fish"))),
+    "bash": os.path.expanduser(os.environ.get("KITTY_STYLER_BASHRC", "~/.bashrc")),
+}
+SHELL_RC_NAMES = {"zsh": ".zshrc", "fish": "config.fish", "bash": ".bashrc"}
+NOT_FOUND = {"zsh": "zsh: command not found: sl", "fish": "fish: Unknown command: sl",
+             "bash": "bash: sl: command not found"}
+STARSHIP_BIN = shutil.which("starship")
+# Lines Kitty Styler adds to the shell config so starship takes over the prompt. They are skipped
+# when KITTY_STYLER_BASE_PROMPT is set, which is how the preview draws the shell's own prompt.
+SWITCH_TOP_BEGIN = "# >>> KITTY STYLER PROMPT SETUP >>>"
+SWITCH_TOP_END = "# <<< KITTY STYLER PROMPT SETUP <<<"
+SWITCH_BEGIN = "# >>> KITTY STYLER PROMPT SWITCH >>>"
+SWITCH_END = "# <<< KITTY STYLER PROMPT SWITCH <<<"
+SWITCH_NOTE = "# Managed by Kitty Styler: the prompt comes from starship. Pick your own prompt there to undo."
+SWITCH_LINES = {
+    # Before anything else, so Powerlevel10k's instant prompt (CachyOS loads it first thing) stays off.
+    "zsh_top": ["if [[ -z $KITTY_STYLER_BASE_PROMPT ]]; then",
+                "  POWERLEVEL9K_INSTANT_PROMPT=off",
+                "  POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD=true",
+                "fi"],
+    "zsh": ["if [[ -z $KITTY_STYLER_BASE_PROMPT ]]; then",
+            "  (( $+functions[prompt_powerlevel9k_teardown] )) && prompt_powerlevel9k_teardown",
+            '  eval "$(starship init zsh)"',
+            "fi"],
+    "fish": ["if status is-interactive; and not set -q KITTY_STYLER_BASE_PROMPT",
+             "    starship init fish | source",
+             "end"],
+    "bash": ['if [[ -z $KITTY_STYLER_BASE_PROMPT && $- == *i* ]]; then',
+             '  eval "$(starship init bash)"',
+             "fi"],
+}
+SYNTAX_CHECK = {"zsh": ["zsh", "-n"], "fish": ["fish", "--no-execute"], "bash": ["bash", "-n"]}
+# Prompt choices: the shell's own prompt, starship with the user's starship.toml, or styled here.
+PROMPT_MODES = {"base": "Your own prompt", "starship": "Starship, your starship.toml",
+                "styled": "Starship, styled here"}
+# Renders the prompt for each exit code the preview's sample commands end with. \x1e separates
+# the parts: N engine name, then P left prompt, R right prompt per code, E end of each.
+PREVIEW_STATUSES = (0, 1, 127)
+RENDER_SCRIPTS = {
+    "zsh": r"""unset HISTFILE
+_ks_render() {
+  local f
+  for f in $precmd_functions; do (exit $1); $f; done
+  print -rn -- $'\x1eP'; print -rnP -- "$PROMPT"; print -rn -- $'\x1eR'; print -rnP -- "$RPROMPT"
+  print -rn -- $'\x1eE'
+}
+if [[ $PROMPT == *starship* ]]; then n=Starship
+elif (( ${precmd_functions[(I)_p9k_precmd]} )); then n=Powerlevel10k
+elif [[ -n $ZSH_THEME ]]; then n="oh-my-zsh theme $ZSH_THEME"
+else n="zsh prompt"; fi
+print -rn -- $'\x1eN'"$n"$'\x1eE'
+for s in 0 1 127; do _ks_render $s; done""",
+    "fish": r"""function _ks_status; return $argv[1]; end
+if functions fish_prompt | string match -q '*starship*'; set n Starship
+else if set -q tide_left_prompt_items; set n Tide
+else; set n "fish prompt"; end
+printf '\x1eN%s\x1eE' $n
+for s in 0 1 127
+    printf '\x1eP'; _ks_status $s; fish_prompt
+    printf '\x1eR'; _ks_status $s; functions -q fish_right_prompt; and fish_right_prompt
+    printf '\x1eE'
+end""",
+    "bash": r"""unset HISTFILE
+case "$PROMPT_COMMAND" in *starship*) n=Starship ;; *) n="bash prompt" ;; esac
+printf '\x1eN%s\x1eE' "$n"
+for s in 0 1 127; do
+  (exit $s); eval "$PROMPT_COMMAND"
+  printf '\x1eP%s\x1eR\x1eE' "${PS1@P}"
+done""",
+}
+RENDER_WIDTH = 200
+SHELL_FLAGS = {"zsh": ["-i", "-c"], "fish": ["-i", "-c"], "bash": ["-i", "-c"]}
+
+
+def kitty_shell(conf):
+    """zsh, fish or bash: the shell kitty starts (its shell option, else the login shell); None otherwise."""
+    if os.environ.get("KITTY_STYLER_SHELL"):
+        return os.environ["KITTY_STYLER_SHELL"]
+    value = conf.get("shell", ".").split()
+    name = os.path.basename(value[0]) if value and value[0] != "." else ""
+    if name not in SHELL_RC:
+        try:
+            name = os.path.basename(pwd.getpwuid(os.getuid()).pw_shell)
+        except KeyError:
+            name = os.path.basename(os.environ.get("SHELL", ""))
+    return name if name in SHELL_RC and shutil.which(name) else None
+
+
+def xterm_color(n):
+    """Hex for xterm 256-colour index n >= 16."""
+    if n >= 232:
+        v = 8 + (n - 232) * 10
+        return f"#{v:02x}{v:02x}{v:02x}"
+    n -= 16
+    steps = (0, 95, 135, 175, 215, 255)
+    return f"#{steps[n // 36]:02x}{steps[n // 6 % 6]:02x}{steps[n % 6]:02x}"
+
+
+ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[([0-9;:<=>?]*)([@-~])|\x1b.?|([^\x1b]+)")
+
+
+def ansi_rows(text):
+    """Rows of (char, fg, bg, attrs) cells, from text a terminal would draw.
+
+    Colours are kept as specs: None (default), 0-15 (the theme's colourN) or "#rrggbb", so the
+    preview can still follow the theme. Handles the cursor moves prompts use for multi-line layouts.
+    """
+    rows, r, col = [[]], 0, 0
+    fg = bg = None
+    attrs = set()
+
+    def put(ch):
+        nonlocal col
+        row = rows[r]
+        while len(row) < col:
+            row.append((" ", None, None, ""))
+        cell = (ch, fg, bg, "".join(sorted(attrs)))
+        if col < len(row):
+            row[col] = cell
+        else:
+            row.append(cell)
+        col += 1
+
+    for m in ANSI_RE.finditer(text):
+        if m.group(3) is not None:
+            for ch in m.group(3):
+                if ch == "\n":
+                    r, col = r + 1, 0
+                    while len(rows) <= r:
+                        rows.append([])
+                elif ch == "\r":
+                    col = 0
+                elif ch == "\t":
+                    col = (col // 8 + 1) * 8
+                elif ch >= " ":
+                    put(ch)
+            continue
+        params, final = m.group(1), m.group(2)
+        if final is None:
+            continue
+        nums = [int(p) if p.isdigit() else 0 for p in re.split("[;:]", params)] if params else [0]
+        n = nums[0] or 1
+        if final == "A":
+            r = max(0, r - n)
+        elif final == "B":
+            r += n
+            while len(rows) <= r:
+                rows.append([])
+        elif final == "C":
+            col += n
+        elif final == "D":
+            col = max(0, col - n)
+        elif final == "G":
+            col = n - 1
+        elif final == "K" and nums[0] == 0:
+            del rows[r][col:]
+        elif final == "m" and not params.startswith(("<", ">", "?", "=")):
+            i = 0
+            while i < len(nums):
+                p = nums[i]
+                if p == 0:
+                    fg = bg = None
+                    attrs.clear()
+                elif p in (1, 3, 4):
+                    attrs.add({1: "b", 3: "i", 4: "u"}[p])
+                elif p in (22, 23, 24):
+                    attrs.discard({22: "b", 23: "i", 24: "u"}[p])
+                elif 30 <= p <= 37 or 90 <= p <= 97:
+                    fg = p - 30 if p < 90 else p - 82
+                elif 40 <= p <= 47 or 100 <= p <= 107:
+                    bg = p - 40 if p < 100 else p - 92
+                elif p == 39:
+                    fg = None
+                elif p == 49:
+                    bg = None
+                elif p in (38, 48) and i + 1 < len(nums):
+                    if nums[i + 1] == 5 and i + 2 < len(nums):
+                        c = nums[i + 2]
+                        c = c if c < 16 else xterm_color(c)
+                        i += 2
+                    elif nums[i + 1] == 2 and i + 4 < len(nums):
+                        c = "#%02x%02x%02x" % tuple(nums[i + 2:i + 5])
+                        i += 4
+                    else:
+                        c = None
+                    if p == 38:
+                        fg = c
+                    else:
+                        bg = c
+                i += 1
+    return rows
+
+
+def cells_runs(cells, strip=False):
+    """Cells to (text, fg, bg, attrs) runs; a long run of one plain character (the gap before a
+    right-hand part, filled with spaces or a line) becomes a "\\0right" marker carrying that character.
+    strip drops trailing blank cells; the left prompt keeps them, as the command follows them."""
+    while strip and cells and cells[-1][0] == " " and cells[-1][2] is None:
+        cells = cells[:-1]
+    runs, i = [], 0
+    while i < len(cells):
+        j = i
+        while j < len(cells) and cells[j] == cells[i]:
+            j += 1
+        ch, fg, bg, attrs = cells[i]
+        if j - i >= 20 and bg is None and i and j < len(cells):
+            runs.append(("\0right" + ("" if ch == " " else ch), fg, None, ""))
+        elif runs and runs[-1][1:] == (fg, bg, attrs) and not runs[-1][0].startswith("\0"):
+            runs[-1] = (runs[-1][0] + ch * (j - i), fg, bg, attrs)
+        else:
+            runs.append((ch * (j - i), fg, bg, attrs))
+        i = j
+    return runs
+
+
+def run_quiet(cmd, env, script=None, timeout=15):
+    """Run a command in its own process group, cwd home; stdout, or None on failure.
+
+    The group is killed afterwards, so helpers the shell left running (gitstatusd) go too.
+    """
+    try:
+        proc = subprocess.Popen(cmd + ([script] if script else []), cwd=os.path.expanduser("~"), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError:
+        return None
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        out = None
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+    return out.decode("utf-8", "replace") if out is not None else None
+
+
+def render_env(**extra):
+    env = dict(os.environ)
+    for key in ("STARSHIP_SESSION_KEY", "STARSHIP_SHELL", "KITTY_STYLER_BASE_PROMPT"):
+        env.pop(key, None)
+    env.update(TERM="xterm-256color", COLUMNS=str(RENDER_WIDTH), LINES="50", PWD=os.path.expanduser("~"),
+               **extra)
+    return env
+
+
+def render_shell_prompt(shell):
+    """The shell's own prompt (without Kitty Styler's starship switch): (engine name,
+    {status: (left rows, right runs)}), or None when it could not be read."""
+    out = run_quiet([shell, *SHELL_FLAGS[shell]], render_env(KITTY_STYLER_BASE_PROMPT="1"),
+                    RENDER_SCRIPTS[shell])
+    if not out:
+        return None
+    m = re.search("\x1eN(.*?)\x1eE", out)
+    parts = re.findall("\x1eP(.*?)\x1eR(.*?)\x1eE", out, re.S)
+    if not m or len(parts) != len(PREVIEW_STATUSES):
+        return None
+    return m.group(1), {s: prompt_parts(left, right) for s, (left, right) in zip(PREVIEW_STATUSES, parts)}
+
+
+def render_starship(config_text):
+    """starship's prompt for this config: ("Starship", {status: (left rows, right runs)}), or None."""
+    if not STARSHIP_BIN:
+        return None
+    fd, path = tempfile.mkstemp(prefix="kitty-styler-", suffix=".toml", dir=os.environ.get("XDG_RUNTIME_DIR"))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(config_text)
+        env = render_env(STARSHIP_CONFIG=path)
+        out = {}
+        for status in PREVIEW_STATUSES:
+            args = [STARSHIP_BIN, "prompt", f"--status={status}", f"--terminal-width={RENDER_WIDTH}"]
+            if status == 1:
+                # The preview's slow command.
+                args.append("--cmd-duration=5000")
+            left = run_quiet(args, env)
+            right = run_quiet(args + ["--right"], env)
+            if left is None:
+                return None
+            out[status] = prompt_parts(left, right or "")
+        return "Starship", out
+    finally:
+        os.remove(path)
+
+
+def prompt_parts(left, right):
+    """Left prompt as rows of runs (the last row is where the command is typed), right prompt as runs."""
+    cells = ansi_rows(left)
+    rows = [cells_runs(r, strip=i < len(cells) - 1) for i, r in enumerate(cells)]
+    right_rows = ansi_rows(right.rstrip("\n"))
+    return rows, cells_runs(right_rows[-1], strip=True) if right_rows else []
+
+
+def strip_switch(lines):
+    """Shell config lines without our prompt switch blocks; also says whether they were there."""
+    kept, block, found = [], False, False
+    for line in lines:
+        if line in (SWITCH_TOP_BEGIN, SWITCH_BEGIN):
+            block = found = True
+            if line == SWITCH_BEGIN and kept and not kept[-1].strip():
+                kept.pop()
+        elif block:
+            block = line not in (SWITCH_TOP_END, SWITCH_END)
+        else:
+            kept.append(line)
+    return kept, found
+
+
+def own_starship(shell):
+    """True when the shell config starts starship itself, without our switch (fish: conf.d too)."""
+    kept, _found = strip_switch(read(SHELL_RC[shell]).splitlines())
+    if shell == "fish":
+        for path in sorted(glob.glob(os.path.join(os.path.dirname(SHELL_RC[shell]), "conf.d", "*.fish"))):
+            kept += read(path).splitlines()
+    return any(re.search(r"starship\s+init", ln) and not ln.lstrip().startswith("#") for ln in kept)
+
+
+def prompt_choices():
+    """The prompt modes this machine can offer, in dropdown order."""
+    if not KITTY_SHELL:
+        return ["starship", "styled"] if STARSHIP_AVAILABLE else []
+    if own_starship(KITTY_SHELL):
+        return ["starship", "styled"]
+    return ["base", "starship", "styled"] if STARSHIP_BIN else ["base"]
+
+
+def strip_prompt_block(text):
+    """starship.toml text without our prompt block."""
+    out, block = [], False
+    for line in text.splitlines():
+        if line == PROMPT_BEGIN:
+            block = True
+        elif block:
+            block = line != PROMPT_END
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def apply_switch(shell, on):
+    """Add or remove the lines that make the shell use starship; returns a status line."""
+    path = SHELL_RC[shell]
+    text = read(path)
+    kept, found = strip_switch(text.splitlines())
+    if on == found:
+        # Already as wanted; leave the blocks where they are.
+        return ""
+    out = list(kept)
+    if on:
+        if shell == "zsh":
+            out = [SWITCH_TOP_BEGIN, SWITCH_NOTE, *SWITCH_LINES["zsh_top"], SWITCH_TOP_END, *out]
+        while out and not out[-1].strip():
+            out.pop()
+        out += ["", SWITCH_BEGIN, SWITCH_NOTE, *SWITCH_LINES[shell], SWITCH_END]
+    new = "\n".join(out) + "\n"
+    if new == text:
+        return ""
+    if shell_syntax_ok(shell, text) and not shell_syntax_ok(shell, new):
+        return f"Prompt not switched: {SHELL_RC_NAMES[shell]} would not be valid {shell}."
+    if text and not os.path.exists(f"{path}.bak-kitty-styler"):
+        shutil.copy2(path, f"{path}.bak-kitty-styler")
+    write_atomic(path, new)
+    if on:
+        return f"{shell} now uses starship for its prompt, from the next new shell."
+    return f"{shell} uses your own prompt again, from the next new shell."
+
+
+def shell_syntax_ok(shell, text):
+    try:
+        return subprocess.run(SYNTAX_CHECK[shell], input=text, capture_output=True, text=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+KITTY_SHELL = kitty_shell(parse_conf_file(CONF))
+# The Shell (zsh) section edits .zshrc, which only matters when kitty runs zsh.
+ZSH_AVAILABLE = ZSH_AVAILABLE and KITTY_SHELL == "zsh"
+
+
 class Cursor(Gtk.DrawingArea):
     """The preview's cursor as its own widget, so blinking doesn't repaint the whole preview.
 
@@ -480,13 +872,18 @@ class Preview(Gtk.DrawingArea):
                 if text == "\0cursor":
                     cursor_xy = (x, y)
                     continue
-                if text == "\0right":
+                if text.startswith("\0right"):
                     # Right prompt: the rest of the line ends at the right padding. Like zsh,
-                    # drop it when it would run into the command.
+                    # drop it when it would run into the command. A character after the marker
+                    # fills the gap (Powerlevel10k's lines between left and right).
                     rest = sum(len(t) for t, *_ in line[j + 1:])
                     right_x = win[0] + win[2] - pad - rest * cw
                     if right_x < x + cw:
                         break
+                    fill = text[len("\0right"):]
+                    if fill:
+                        cr.set_source_rgb(*hex_rgb(fg))
+                        self.draw_cells(cr, layout, fill * int((right_x - x) / cw), attrs, x, y, cw, lh, yoff)
                     x = right_x
                     continue
                 n = len(text)
@@ -578,7 +975,7 @@ class Preview(Gtk.DrawingArea):
         cr.set_source_rgb(*hex_rgb(bar_bg))
         cr.rectangle(x, y, w, h)
         cr.fill()
-        tabs = [("1: zsh", True), ("2: nvim", False), ("3: btop", False)]
+        tabs = [(f"1: {KITTY_SHELL or 'zsh'}", True), ("2: nvim", False), ("3: btop", False)]
         extra = {"slant": h * 0.9, "powerline": h * 0.5, "separator": cw * 2}.get(style, 0)
         total = sum(len(f" {t} ") * cw + extra for t, _a in tabs)
         align = self.app.settings["tab_bar_align"]
@@ -727,6 +1124,13 @@ class StylerWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Kitty Styler", default_width=1350, default_height=780)
         self.themes = load_themes()
         self.fonts = mono_fonts()
+        self.prompt_choices = prompt_choices()
+        CHOICE_NOTES["prompt_mode"] = dict(PROMPT_MODES)
+        if KITTY_SHELL:
+            CHOICE_NOTES["prompt_mode"]["base"] = f"Your own {KITTY_SHELL} prompt"
+        # Real prompts drawn by the shell or starship, per prompt mode; None when that failed.
+        self.renders = {}
+        self.render_gen = 0
         self.load_current()
         self.plugin_catalogue = None
         css = Gtk.CssProvider()
@@ -754,10 +1158,12 @@ class StylerWindow(Gtk.ApplicationWindow):
         rows = [("Theme", "theme", list(self.themes)), ("Font", "font_family", self.fonts)]
         rows += [(label, key, choices) for label, key, choices, _d in OPTIONS]
         rows.append(("Tab bar style", "tab_bar", list(TAB_STYLES)))
-        if STARSHIP_AVAILABLE:
-            rows.append(("Prompt (starship)", None, None))
-            rows.append(("Style the prompt", "prompt_on", None))
-            rows += [(label, key, list(choices) if key else None) for label, key, choices, _d, _n in PROMPT_OPTIONS]
+        if self.prompt_choices:
+            rows.append(("Prompt", None, None))
+            rows.append(("Prompt", "prompt_mode", self.prompt_choices))
+            if "styled" in self.prompt_choices:
+                rows += [(label, key, list(choices) if key else None)
+                         for label, key, choices, _d, _n in PROMPT_OPTIONS]
         if ZSH_AVAILABLE:
             has = dict(self.zsh_info, colours=self.zsh_info["hl"] or self.zsh_info["suggest"])
             rows.append(("Shell (zsh)", None, None))
@@ -798,19 +1204,6 @@ class StylerWindow(Gtk.ApplicationWindow):
                 grid.attach(self.plugins_note, 0, row, 2, 1)
                 row += 1
                 continue
-            if key == "prompt_on":
-                grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
-                self.prompt_switch = Gtk.Switch(halign=Gtk.Align.START)
-                self.prompt_switch.connect("notify::active", self.on_prompt_toggled)
-                grid.attach(self.prompt_switch, 1, row, 1, 1)
-                row += 1
-                note = Gtk.Label(label="On: Apply writes a prompt block into starship.toml (backed up first). "
-                                       "Off: Apply removes that block, so your own starship config is used.",
-                                 xalign=0, wrap=True, max_width_chars=34)
-                note.add_css_class("dim-label")
-                grid.attach(note, 0, row, 2, 1)
-                row += 1
-                continue
             name_label = Gtk.Label(label=label, xalign=0)
             grid.attach(name_label, 0, row, 1, 1)
             notes = CHOICE_NOTES.get(key, {})
@@ -840,9 +1233,14 @@ class StylerWindow(Gtk.ApplicationWindow):
                 grid.attach(step, 1, row, 1, 1)
             else:
                 grid.attach(dd, 1, row, 1, 1)
-            if in_prompt:
+            if in_prompt and key != "prompt_mode":
                 self.prompt_widgets += [name_label, step if stepped else dd]
             row += 1
+            if key == "prompt_mode":
+                self.prompt_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34)
+                self.prompt_note.add_css_class("dim-label")
+                grid.attach(self.prompt_note, 0, row, 2, 1)
+                row += 1
             if key == "theme":
                 self.theme_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, selectable=True)
                 self.theme_note.add_css_class("dim-label")
@@ -875,6 +1273,7 @@ class StylerWindow(Gtk.ApplicationWindow):
 
         self.blink_id = None
         self.sync_dropdowns()
+        self.ensure_render()
 
     # ---- state ----
     def load_current(self):
@@ -895,7 +1294,12 @@ class StylerWindow(Gtk.ApplicationWindow):
             if m and m.group(1).strip() in self.themes:
                 s["theme"] = m.group(1).strip()
         s.update(load_prompt_settings())
-        s["prompt_on"] = PROMPT_BEGIN in read(STARSHIP_CONF).splitlines()
+        styled = PROMPT_BEGIN in read(STARSHIP_CONF).splitlines()
+        uses_starship = (not KITTY_SHELL or own_starship(KITTY_SHELL)
+                         or strip_switch(read(SHELL_RC[KITTY_SHELL]).splitlines())[1])
+        mode = ("styled" if styled else "starship") if uses_starship else "base"
+        s["prompt_mode"] = mode if mode in self.prompt_choices or not self.prompt_choices \
+            else self.prompt_choices[0]
         self.zsh_info = {"omz": False, "hl": False, "suggest": False}
         if ZSH_AVAILABLE:
             shell, self.zsh_info = load_shell()
@@ -917,10 +1321,8 @@ class StylerWindow(Gtk.ApplicationWindow):
                 value = norm
                 self.settings[key] = value
             dd.set_selected(dd.choices.index(value))
-        if STARSHIP_AVAILABLE:
-            self.prompt_switch.set_active(self.settings["prompt_on"])
-            for widget in self.prompt_widgets:
-                widget.set_visible(self.settings["prompt_on"])
+        for widget in self.prompt_widgets:
+            widget.set_visible(self.settings["prompt_mode"] == "styled")
         self.syncing = False
         self.refresh()
 
@@ -931,15 +1333,37 @@ class StylerWindow(Gtk.ApplicationWindow):
         if self.syncing:
             return
         self.settings[key] = dd.choices[dd.get_selected()]
+        if key == "prompt_mode":
+            for widget in self.prompt_widgets:
+                widget.set_visible(self.settings[key] == "styled")
+            self.ensure_render()
         self.refresh()
 
-    def on_prompt_toggled(self, switch, _pspec):
-        if self.syncing:
+    def ensure_render(self):
+        """Start drawing the real prompt for the picked mode in the background, once."""
+        mode = self.settings["prompt_mode"]
+        if mode == "styled" or mode in self.renders:
             return
-        self.settings["prompt_on"] = switch.get_active()
-        for widget in self.prompt_widgets:
-            widget.set_visible(switch.get_active())
+        if mode == "base":
+            job = (render_shell_prompt, KITTY_SHELL)
+        else:
+            # starship.toml as it is without our prompt block, which Apply removes in this mode.
+            job = (render_starship, strip_prompt_block(read(STARSHIP_CONF)))
+        self.renders[mode] = "pending"
+        gen = self.render_gen
+
+        def work():
+            result = job[0](job[1])
+            GLib.idle_add(self.on_rendered, gen, mode, result)
+
+        threading.Thread(target=work, daemon=True).start()
         self.refresh()
+
+    def on_rendered(self, gen, mode, result):
+        if gen == self.render_gen:
+            self.renders[mode] = result
+            self.refresh()
+        return False
 
     def on_plugins(self, _btn):
         if self.plugin_catalogue is None:
@@ -977,6 +1401,8 @@ class StylerWindow(Gtk.ApplicationWindow):
                     f'Pick "{BASE_LABEL}" to go back to your own colours.')
         self.theme_note.set_label(note)
         self.theme_note.set_visible(bool(note))
+        if self.prompt_choices:
+            self.prompt_note.set_label(self.prompt_note_text())
         self.reload_btn.set_visible(len(self.themes) == 1)
         if ZSH_AVAILABLE and self.zsh_info["omz"]:
             on = self.settings["z_plugins"]
@@ -994,6 +1420,33 @@ class StylerWindow(Gtk.ApplicationWindow):
             self.blink_id = GLib.timeout_add(ms, self.blink)
         self.preview.queue_draw()
 
+    def prompt_note_text(self):
+        mode = self.settings["prompt_mode"]
+        rc = SHELL_RC_NAMES.get(KITTY_SHELL)
+        switch = KITTY_SHELL and not own_starship(KITTY_SHELL)
+        render = self.renders.get(mode, "pending")
+        if render == "pending":
+            seen = "Reading your prompt…"
+        elif render is None and mode != "styled":
+            seen = "Could not read your prompt, so the preview shows a sample one."
+        else:
+            seen = ""
+        if mode == "base":
+            name = render[0] if isinstance(render, tuple) else ""
+            name = name if name and not name.endswith(" prompt") else "its own prompt"
+            out = f"Kitty starts {KITTY_SHELL}, and its prompt is {name}. Apply leaves it as it is."
+            if strip_switch(read(SHELL_RC[KITTY_SHELL]).splitlines())[1]:
+                out += f" Apply removes Kitty Styler's starship lines from {rc}."
+            if not STARSHIP_BIN:
+                out += " Install starship to restyle the prompt here."
+        else:
+            out = ("Your starship.toml as it is." if mode == "starship" else
+                   "Apply writes a prompt block into starship.toml (backed up first).")
+            if switch:
+                out += f" Apply adds a few lines to {rc} so {KITTY_SHELL} uses starship; " \
+                       f'"{CHOICE_NOTES["prompt_mode"]["base"]}" takes them out again.'
+        return " ".join(x for x in (out, seen) if x)
+
     def blink(self):
         cursor = self.preview.cursor
         cursor.set_opacity(0 if cursor.get_opacity() else 1)
@@ -1006,9 +1459,18 @@ class StylerWindow(Gtk.ApplicationWindow):
         k = [c[f"color{i}"] for i in range(16)]
 
         p = self.settings
-        if not p["prompt_on"]:
-            # Their own prompt is unknown, so show ours with its defaults.
+        real = self.renders.get(p["prompt_mode"])
+        real = real if isinstance(real, tuple) else None
+        if p["prompt_mode"] != "styled":
+            # Shown until the real prompt is read, or when that failed: ours with its defaults.
             p = dict(p, **{key: default for _l, key, _c, default, _n in PROMPT_KEYS})
+
+        def spec(value, default):
+            """A colour from the rendered prompt: theme slot 0-15, hex, or None for the default."""
+            return default if value is None else k[value] if isinstance(value, int) else value
+
+        def real_runs(runs):
+            return [(text, spec(f, fg), spec(b, None), attrs) for text, f, b, attrs in runs]
 
         def col(name):
             return c[COLOR_SLOTS[name]]
@@ -1065,6 +1527,17 @@ class StylerWindow(Gtk.ApplicationWindow):
 
         def prompt(cmd, cursor=False, error=None, slow=False, ghost=""):
             """The prompt as preview lines: optional blank line, then one or two lines."""
+            if real:
+                rows, right = real[1][int(error or 0)]
+                lines = [real_runs(row) for row in rows] or [[]]
+                lines[-1] += typed(cmd)
+                if cursor:
+                    lines[-1].append(("\0cursor", fg, None, ""))
+                if ghost and self.zsh_info["suggest"]:
+                    lines[-1].append((ghost, zcol("z_suggest")[0], None, ""))
+                if right:
+                    lines[-1] += [("\0right", fg, None, "")] + real_runs(right)
+                return lines
             left = []
             if p["p_os"] == "show":
                 left += seg(OS_SYMBOLS[detect_os()], p["p_os_color"])
@@ -1128,14 +1601,17 @@ class StylerWindow(Gtk.ApplicationWindow):
             [t("bright  ")] + [("   ", fg, k[i], "") for i in range(8, 16)],
             [t("0123456789 {}[]() <= >= != -> => === ~ | & ** // %")],
             *prompt("sl", error="1", slow=True),
-            [t("zsh: command not found: sl")],
+            [t(NOT_FOUND.get(KITTY_SHELL, NOT_FOUND["zsh"]))],
             *prompt("git sta", cursor=True, error="127", ghost="tus"),
         ]
 
     # ---- actions ----
     def on_reset(self, _btn):
         self.load_current()
+        self.renders.clear()
+        self.render_gen += 1
         self.sync_dropdowns()
+        self.ensure_render()
         self.status.set_label("Reset to what kitty.conf has now.")
 
     def on_apply(self, _btn):
@@ -1145,6 +1621,10 @@ class StylerWindow(Gtk.ApplicationWindow):
             msg = f"Could not save: {e}"
         self.file_conf = parse_conf_file(CONF)
         self.status.set_label(msg)
+        self.renders.clear()
+        self.render_gen += 1
+        self.ensure_render()
+        self.refresh()
 
 def same(a, b):
     try:
@@ -1216,8 +1696,12 @@ def apply_all(s, themes, colors, file_conf):
     msg = ["Applied and reloaded open kitty windows."]
     if backup:
         msg.append(f"Backup: {backup}")
-    if STARSHIP_AVAILABLE:
-        msg.append(apply_prompt(s if s["prompt_on"] else None))
+    mode = s.get("prompt_mode")
+    if STARSHIP_AVAILABLE and mode:
+        msg.append(apply_prompt(s if mode == "styled" else None))
+    if KITTY_SHELL and mode:
+        msg.append(apply_switch(KITTY_SHELL, mode != "base" and bool(STARSHIP_BIN)
+                                and not own_starship(KITTY_SHELL)))
     if NOCTALIA or STARSHIP_BEGIN in read(STARSHIP_CONF).splitlines():
         # Without Noctalia the prompt's colour names already follow kitty's colours; this
         # branch then only cleans up a palette left from before.
