@@ -176,9 +176,65 @@ PROMPT_OPTIONS = [
     ("Time colour", "p_time_color", *COLORS[:1], "cyan", PROMPT_COLORS),
 ]
 PROMPT_KEYS = [o for o in PROMPT_OPTIONS if o[1]]
+# Shell (zsh). Kitty Styler owns two blocks in .zshrc: the plugin list just before the line that
+# loads oh-my-zsh, and everything else at the end, after zsh-syntax-highlighting has loaded.
+ZSHRC = os.path.expanduser(os.environ.get("KITTY_STYLER_ZSHRC",
+                                          os.path.join(os.environ.get("ZDOTDIR", "~"), ".zshrc")))
+ZSH_AVAILABLE = shutil.which("zsh") is not None and os.path.exists(ZSHRC)
+ZSH_PLUGINS_BEGIN = "# >>> KITTY STYLER ZSH PLUGINS >>>"
+ZSH_PLUGINS_END = "# <<< KITTY STYLER ZSH PLUGINS <<<"
+ZSH_BEGIN = "# >>> KITTY STYLER ZSH >>>"
+ZSH_END = "# <<< KITTY STYLER ZSH <<<"
+ZSH_STATE = "# kitty-styler shell settings: "
+# Choice that writes nothing, so the shell keeps what its own config sets.
+KEEP = "keep"
+STYLE_ATTRS = {"precommand": "u"}
+ZSH_COLORS = {KEEP: "Leave as is", **PROMPT_COLORS, "black": "Black"}
+ON_OFF = {KEEP: "Leave as is", "on": "On", "off": "Off"}
+# Colours while typing: (label, settings key, zsh-syntax-highlighting styles, the plugin's own
+# default as (colour, attrs)). None styles is the suggestion. Bold/underline stay when a colour is
+# picked: the row's attrs, plus STYLE_ATTRS for styles that differ from the rest of their row.
+ZSH_HL = [
+    ("Commands", "z_cmd", ["arg0", "precommand"], ("green", "")),
+    ("Unknown commands", "z_unknown", ["unknown-token"], ("red", "b")),
+    ("Quoted text", "z_string", ["single-quoted-argument", "double-quoted-argument",
+                                 "dollar-quoted-argument"], ("yellow", "")),
+    ("Paths", "z_path", ["path"], ("", "u")),
+    ("Options (-x, --long)", "z_option", ["single-hyphen-option", "double-hyphen-option"], ("", "")),
+    ("Suggestion (ghost text)", "z_suggest", None, ("bright-black", "")),
+]
+# (label, settings key, choices, display names, what it needs: hl, suggest, colours or None).
+ZSH_OPTIONS = [("Colours while typing", None, None, None, "colours")]
+ZSH_OPTIONS += [(label, key, list(ZSH_COLORS), ZSH_COLORS, "suggest" if styles is None else "hl")
+                for label, key, styles, _d in ZSH_HL]
+ZSH_OPTIONS += [
+    ("Behaviour", None, None, None, None),
+    ("Completion matching", "z_case", [KEEP, "insensitive", "sensitive"],
+     {KEEP: "Leave as is", "insensitive": "Ignore upper/lower case", "sensitive": "Exact case"}, None),
+    ("Typo correction", "z_correct", [KEEP, "off", "commands", "all"],
+     {KEEP: "Leave as is", "off": "Off", "commands": "Command names only", "all": "Commands and arguments"}, None),
+    ("Type a folder name to cd", "z_autocd", list(ON_OFF), ON_OFF, None),
+    ("History size", "z_history", [KEEP, "10000", "50000", "100000", "1000000"],
+     {KEEP: "Leave as is", "10000": "10 000 commands", "50000": "50 000 commands",
+      "100000": "100 000 commands", "1000000": "1 000 000 commands"}, None),
+    ("Share history between shells", "z_share", list(ON_OFF), ON_OFF, None),
+    ("Suggestions come from", "z_suggest_src", [KEEP, "history", "history completion"],
+     {KEEP: "Leave as is", "history": "History", "history completion": "History, then completion"}, "suggest"),
+    ("Terminal beep", "z_beep", list(ON_OFF), ON_OFF, None),
+]
+ZSH_KEYS = [o for o in ZSH_OPTIONS if o[1]]
+TOP_HEADINGS = ("Prompt (starship)", "Shell (zsh)")
+# Commands the preview shows as not found.
+PREVIEW_UNKNOWN = {"sl"}
 CHOICE_NOTES = {"cursor_blink_interval": {"-1": "-1 (system default)", "0": "0 (no blink)"},
                 "cursor_trail": {"0": "0 (off)"}}
 CHOICE_NOTES.update({key: names for _l, key, _c, _d, names in PROMPT_KEYS if names})
+CHOICE_NOTES.update({key: names for _l, key, _c, names, _n in ZSH_KEYS})
+CSS = """
+.plugin-card { background: alpha(@theme_fg_color, 0.07); border: 1px solid alpha(@theme_fg_color, 0.3);
+               border-radius: 8px; padding: 8px 10px; margin: 4px 8px; }
+.plugin-card:disabled { opacity: 0.6; }
+"""
 
 
 def parse_conf(text):
@@ -561,12 +617,100 @@ class Preview(Gtk.DrawingArea):
                 x += cw * 2
 
 
+class PluginPicker(Gtk.Window):
+    """Searchable tick list of oh-my-zsh plugins, with what each does and the aliases it adds."""
+
+    def __init__(self, win):
+        super().__init__(transient_for=win, modal=True, title="oh-my-zsh plugins",
+                         default_width=640, default_height=760)
+        self.win = win
+        header = Gtk.HeaderBar()
+        done = Gtk.Button(label="Done")
+        done.add_css_class("suggested-action")
+        done.connect("clicked", lambda _b: self.close())
+        header.pack_end(done)
+        self.set_titlebar(header)
+
+        self.search = Gtk.SearchEntry(placeholder_text="Search names and descriptions", hexpand=True)
+        self.search.connect("search-changed", lambda _e: self.listbox.invalidate_filter())
+        self.only_on = Gtk.CheckButton(label="Only ticked")
+        self.only_on.connect("toggled", lambda _c: self.listbox.invalidate_filter())
+        bar = Gtk.Box(spacing=10, margin_top=10, margin_bottom=6, margin_start=12, margin_end=12)
+        bar.append(self.search)
+        bar.append(self.only_on)
+        hint = Gtk.Label(label="Ticked plugins load in new shells after Apply. Each plugin adds a little "
+                               "to shell start-up time.", xalign=0, wrap=True, margin_start=12, margin_end=12)
+        hint.add_css_class("dim-label")
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.set_filter_func(self.filter)
+        self.rows = {}
+        on = win.settings["z_plugins"]
+        for name, (desc, aliases) in win.plugin_catalogue.items():
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["plugin-card"])
+            check = Gtk.CheckButton(active=name in on)
+            title = Gtk.Label(label=name, xalign=0)
+            title.add_css_class("heading")
+            check.set_child(title)
+            check.connect("toggled", self.on_toggled, name)
+            card.append(check)
+            elsewhere = loaded_elsewhere(name, win.zsh_info) and name not in on
+            if elsewhere:
+                check.set_sensitive(False)
+                desc = "Already loaded by your zsh config. " + desc
+            if desc:
+                card.append(Gtk.Label(label=desc, xalign=0, wrap=True, max_width_chars=70))
+            if aliases:
+                more = f" and {len(aliases) - 12} more" if len(aliases) > 12 else ""
+                text = f"Adds {len(aliases)} alias{'es' if len(aliases) > 1 else ''}: {', '.join(aliases[:12])}{more}"
+                extra = Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=70, selectable=True)
+                extra.add_css_class("dim-label")
+                card.append(extra)
+            row = Gtk.ListBoxRow(child=card, activatable=False)
+            row.search_text = f"{name} {desc}".lower()
+            row.check = check
+            self.rows[name] = row
+            self.listbox.append(row)
+        if not self.rows:
+            self.listbox.append(Gtk.Label(label="No oh-my-zsh plugins found.", margin_top=20))
+
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, child=self.listbox)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(bar)
+        box.append(hint)
+        box.append(scroll)
+        self.set_child(box)
+
+    def filter(self, row):
+        if not hasattr(row, "check"):
+            return True
+        if self.only_on.get_active() and not row.check.get_active():
+            return False
+        return all(word in row.search_text for word in self.search.get_text().lower().split())
+
+    def on_toggled(self, check, name):
+        on = self.win.settings["z_plugins"]
+        if check.get_active() and name not in on:
+            on.append(name)
+        elif not check.get_active() and name in on:
+            on.remove(name)
+        self.win.refresh()
+
+
 class StylerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Kitty Styler", default_width=1350, default_height=780)
         self.themes = load_themes()
         self.fonts = mono_fonts()
         self.load_current()
+        self.plugin_catalogue = None
+        css = Gtk.CssProvider()
+        if hasattr(css, "load_from_string"):
+            css.load_from_string(CSS)
+        else:
+            css.load_from_data(CSS, -1)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         header = Gtk.HeaderBar()
         apply_btn = Gtk.Button(label="Apply to kitty")
@@ -589,17 +733,44 @@ class StylerWindow(Gtk.ApplicationWindow):
             rows.append(("Prompt (starship)", None, None))
             rows.append(("Style the prompt", "prompt_on", None))
             rows += [(label, key, list(choices) if key else None) for label, key, choices, _d, _n in PROMPT_OPTIONS]
+        if ZSH_AVAILABLE:
+            has = dict(self.zsh_info, colours=self.zsh_info["hl"] or self.zsh_info["suggest"])
+            rows.append(("Shell (zsh)", None, None))
+            if has["omz"]:
+                rows.append(("Plugins (oh-my-zsh)", "z_plugins", None))
+            rows += [(label, key, choices) for label, key, choices, _n, need in ZSH_OPTIONS
+                     if need is None or has[need]]
         # Everything below the prompt switch; hidden while it is off.
         self.prompt_widgets = []
         in_prompt = False
         for label, key, choices in rows:
             if key is None:
+                top = label in TOP_HEADINGS
                 head = Gtk.Label(label=label, xalign=0, margin_top=12)
-                head.add_css_class("heading" if label.startswith("Prompt") else "dim-label")
+                head.add_css_class("heading" if top else "dim-label")
                 grid.attach(head, 0, row, 2, 1)
-                if in_prompt:
+                if top:
+                    in_prompt = label.startswith("Prompt")
+                elif in_prompt:
                     self.prompt_widgets.append(head)
-                in_prompt = in_prompt or label.startswith("Prompt")
+                row += 1
+                if label.startswith("Shell"):
+                    note = Gtk.Label(label='Apply writes these into .zshrc (backed up first). "Leave as is" '
+                                           "writes nothing, so your own zsh config decides.",
+                                     xalign=0, wrap=True, max_width_chars=34)
+                    note.add_css_class("dim-label")
+                    grid.attach(note, 0, row, 2, 1)
+                    row += 1
+                continue
+            if key == "z_plugins":
+                grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+                btn = Gtk.Button(label="Choose plugins…")
+                btn.connect("clicked", self.on_plugins)
+                grid.attach(btn, 1, row, 1, 1)
+                row += 1
+                self.plugins_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34)
+                self.plugins_note.add_css_class("dim-label")
+                grid.attach(self.plugins_note, 0, row, 2, 1)
                 row += 1
                 continue
             if key == "prompt_on":
@@ -694,6 +865,10 @@ class StylerWindow(Gtk.ApplicationWindow):
                 s["theme"] = m.group(1).strip()
         s.update(load_prompt_settings())
         s["prompt_on"] = PROMPT_BEGIN in read(STARSHIP_CONF).splitlines()
+        self.zsh_info = {"omz": False, "hl": False, "suggest": False}
+        if ZSH_AVAILABLE:
+            shell, self.zsh_info = load_shell()
+            s.update(shell)
         self.file_conf = conf
         self.settings = s
 
@@ -735,6 +910,11 @@ class StylerWindow(Gtk.ApplicationWindow):
             widget.set_visible(switch.get_active())
         self.refresh()
 
+    def on_plugins(self, _btn):
+        if self.plugin_catalogue is None:
+            self.plugin_catalogue = omz_plugins(self.zsh_info)
+        PluginPicker(self).present()
+
     def on_reload_themes(self, _btn):
         self.themes = load_themes()
         dd = self.dropdowns["theme"]
@@ -767,6 +947,12 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.theme_note.set_label(note)
         self.theme_note.set_visible(bool(note))
         self.reload_btn.set_visible(len(self.themes) == 1)
+        if ZSH_AVAILABLE and self.zsh_info["omz"]:
+            on = self.settings["z_plugins"]
+            note = f"On: {' '.join(on)}" if on else "None ticked."
+            if not on and self.zsh_info["default_if_empty"]:
+                note += f" Your zsh config then loads its default: {' '.join(self.zsh_info['plugins'])}."
+            self.plugins_note.set_label(note)
         if self.blink_id:
             GLib.source_remove(self.blink_id)
             self.blink_id = None
@@ -817,7 +1003,36 @@ class StylerWindow(Gtk.ApplicationWindow):
             n = int(p["p_dir_len"])
             return "/".join(parts[-n:] if n else parts)
 
-        def prompt(cmd, cursor=False, error=False, slow=False):
+        hl = self.zsh_info["hl"]
+        z = {key: self.settings.get(key, KEEP) for _l, key, _s, _d in ZSH_HL}
+        z_default = {key: default for _l, key, _s, default in ZSH_HL}
+
+        def zcol(key):
+            """(colour, attrs) zsh-syntax-highlighting uses for this kind of word."""
+            color, attrs = z_default[key]
+            color = color if z[key] == KEEP else z[key]
+            return (col(color) if color else fg), attrs
+
+        def typed(cmd):
+            """The command line as zsh-syntax-highlighting colours it."""
+            out, first = [], True
+            for tok in re.findall(r'"[^"]*"|\'[^\']*\'|\s+|[^\s"\']+', cmd):
+                key = None
+                if tok.isspace():
+                    pass
+                elif first:
+                    key, first = ("z_unknown" if tok in PREVIEW_UNKNOWN else "z_cmd"), False
+                elif tok[0] in "\"'":
+                    key = "z_string"
+                elif tok.startswith("-"):
+                    key = "z_option"
+                elif "/" in tok or tok.startswith("~"):
+                    key = "z_path"
+                color, attrs = zcol(key) if key and hl else (fg, "")
+                out.append((tok, color, None, attrs))
+            return out
+
+        def prompt(cmd, cursor=False, error=None, slow=False, ghost=""):
             """The prompt as preview lines: optional blank line, then one or two lines."""
             left = []
             if p["p_os"] == "show":
@@ -833,12 +1048,14 @@ class StylerWindow(Gtk.ApplicationWindow):
             if p["p_gitst"] == "show":
                 left += seg("!?" if caps else "[!?]", p["p_gitst_color"])
             symbol = [(p["p_symbol"], col(p["p_err_color"] if error else p["p_ok_color"]), None, ""),
-                      (" " + cmd, fg, None, "")]
+                      (" ", fg, None, ""), *typed(cmd)]
             if cursor:
                 symbol.append(("\0cursor", fg, None, ""))
+            if ghost and self.zsh_info["suggest"]:
+                symbol.append((ghost, zcol("z_suggest")[0], None, ""))
             right = [("\0right", fg, None, "")]
             if error and p["p_status"] == "show":
-                right += seg("✘ 1", p["p_status_color"])
+                right += seg(f"✘ {error}", p["p_status_color"])
             if slow and p["p_dur"] == "show":
                 right += seg("5s", p["p_dur_color"], word="took ")
             if p["p_langs"] == "show":
@@ -859,7 +1076,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             return (text, color, None, attrs)
 
         return [
-            *prompt("ls -la"),
+            *prompt("ls -la ~/code"),
             [t("drwxr-xr-x  "), t("themes/", k[12], "b"), t("   "), t("run.sh", k[10], "b"), t("   "),
              t("kitty-styler.py", k[2]), t("   README.md   "), t("backup.tar.gz", k[1], "b"),
              t("   "), t("link", k[14], "b"), t(" -> "), t("target", k[6])],
@@ -879,7 +1096,9 @@ class StylerWindow(Gtk.ApplicationWindow):
             [t("normal  ")] + [("   ", fg, k[i], "") for i in range(8)],
             [t("bright  ")] + [("   ", fg, k[i], "") for i in range(8, 16)],
             [t("0123456789 {}[]() <= >= != -> => === ~ | & ** // %")],
-            *prompt("", cursor=True, error=True, slow=True),
+            *prompt("sl", error="1", slow=True),
+            [t("zsh: command not found: sl")],
+            *prompt("git sta", cursor=True, error="127", ghost="tus"),
         ]
 
     # ---- actions ----
@@ -972,6 +1191,8 @@ def apply_all(s, themes, colors, file_conf):
         # Without Noctalia the prompt's colour names already follow kitty's colours; this
         # branch then only cleans up a palette left from before.
         msg.append(apply_starship(s["theme"] if NOCTALIA else BASE_LABEL, colors))
+    if ZSH_AVAILABLE:
+        msg.append(apply_zsh(s))
     return "\n".join(m for m in msg if m)
 
 
@@ -1274,6 +1495,218 @@ def valid_toml(text):
         return True
     except tomllib.TOMLDecodeError:
         return False
+
+
+def expand_path(value):
+    return os.path.expanduser(os.path.expandvars(value.strip().strip("\"'")))
+
+
+def strip_zsh_blocks(lines):
+    """.zshrc lines without our two blocks, the saved shell settings and the plugin list in our block."""
+    kept, saved, plugins, block = [], {}, None, None
+    for line in lines:
+        if line in (ZSH_PLUGINS_BEGIN, ZSH_BEGIN):
+            block = line
+            # Drop the blank line that was added in front of the settings block.
+            if line == ZSH_BEGIN and kept and not kept[-1].strip():
+                kept.pop()
+        elif block:
+            if line in (ZSH_PLUGINS_END, ZSH_END):
+                block = None
+            elif line.startswith(ZSH_STATE):
+                try:
+                    saved = json.loads(line[len(ZSH_STATE):])
+                except ValueError:
+                    pass
+            elif line.startswith("plugins=("):
+                plugins = line[len("plugins=("):].rstrip(")").split()
+        else:
+            kept.append(line)
+    return kept, saved, plugins
+
+
+def zsh_setup(lines):
+    """What .zshrc (without our blocks) does with oh-my-zsh.
+
+    at: index of the line that loads oh-my-zsh, directly or through a distro config it sources
+    (CachyOS's cachyos-config.zsh), or None. plugins: the list loaded now. default_if_empty: the
+    loader fills in its own list when plugins is empty. text: .zshrc plus the loader, for detection.
+    """
+    info = {"at": None, "dir": None, "custom": None, "plugins": [], "default_if_empty": False}
+    loader = ""
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*(?:source|\.)\s+(\S+)", line)
+        if not m:
+            continue
+        path = m.group(1).strip("\"'")
+        if path.endswith("oh-my-zsh.sh"):
+            info["at"] = i
+            break
+        text = read(expand_path(path))
+        if re.search(r"^\s*(?:source|\.)\s+\S*oh-my-zsh\.sh", text, re.M):
+            info["at"], loader = i, text
+            break
+    before = "\n".join(lines[:info["at"]] if info["at"] is not None else lines)
+    info["text"] = "\n".join(lines) + "\n" + loader
+    for name, var in (("dir", "ZSH"), ("custom", "ZSH_CUSTOM")):
+        for text in (before, loader):
+            found = re.findall(rf"^\s*(?:export\s+)?{var}=(\S+)", text, re.M)
+            if found:
+                info[name] = expand_path(found[-1])
+                break
+    if not info["dir"] or not os.path.isdir(info["dir"]):
+        info["dir"] = next((d for d in (os.path.expanduser("~/.oh-my-zsh"), "/usr/share/oh-my-zsh")
+                            if os.path.isdir(d)), None)
+    if info["dir"] and not info["custom"]:
+        info["custom"] = os.path.join(info["dir"], "custom")
+    plugins_re = re.compile(r"(?:^|&&)[ \t]*plugins=\(([^)]*)\)", re.M | re.S)
+    for text in (before, loader):
+        found = list(plugins_re.finditer(text))
+        if found:
+            body = re.sub(r"#[^\n]*", "", found[-1].group(1))
+            info["plugins"] = body.split()
+            break
+    info["default_if_empty"] = re.search(r"-z[^\n]*&&[ \t]*plugins=\(", before + "\n" + loader) is not None
+    info["omz"] = info["at"] is not None and info["dir"] is not None
+    info["hl"] = "zsh-syntax-highlighting" in info["text"]
+    info["suggest"] = "zsh-autosuggestions" in info["text"]
+    return info
+
+
+def load_shell():
+    """Shell settings from .zshrc and what it loads; plugins start from what the shell loads now."""
+    kept, saved, plugins = strip_zsh_blocks(read(ZSHRC).splitlines())
+    info = zsh_setup(kept)
+    s = {key: KEEP for _l, key, *_r in ZSH_KEYS}
+    s.update({k: v for k, v in saved.items() if k in s})
+    s["z_plugins"] = plugins if plugins is not None else list(info["plugins"])
+    return s, info
+
+
+def readme_summary(path):
+    """First paragraph of a plugin README as one line, without markdown."""
+    para = []
+    for line in read(path).splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", "<", "![", "[!", "|", "```", "---", "===", ">")):
+            if para:
+                break
+            continue
+        para.append(s)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", " ".join(para))
+    text = re.sub(r"<[^>]+>", "", text).replace("`", "").replace("**", "")
+    return text if len(text) <= 240 else text[:240].rsplit(" ", 1)[0] + " …"
+
+
+def omz_plugins(info):
+    """{name: (description, alias names)} for the oh-my-zsh and custom plugins, read at runtime."""
+    out = {}
+    for folder in (os.path.join(info["dir"], "plugins"), os.path.join(info["custom"], "plugins")):
+        for script in glob.glob(os.path.join(folder, "*", "*.plugin.zsh")):
+            plugin_dir = os.path.dirname(script)
+            name = os.path.basename(plugin_dir)
+            if name == "example" or os.path.basename(script) != f"{name}.plugin.zsh":
+                continue
+            aliases = re.findall(r"^\s*alias\s+(?:-[gs]\s+)?['\"]?([^=\s'\"]+)=", read(script), re.M)
+            out[name] = (readme_summary(os.path.join(plugin_dir, "README.md")), list(dict.fromkeys(aliases)))
+    return dict(sorted(out.items()))
+
+
+def loaded_elsewhere(name, info):
+    """True when the shell config already sources this plugin itself (CachyOS does for a few)."""
+    return re.search(rf"(?:source|\.)\s+\S*/(?:zsh-)?{re.escape(name)}[/.]", info["text"]) is not None
+
+
+def zsh_style(value, default, style=None):
+    """zsh-syntax-highlighting style for a colour choice, keeping the default's bold/underline."""
+    color, attrs = default
+    attrs += STYLE_ATTRS.get(style, "")
+    color = color if value == KEEP else value
+    parts = ["fg=" + COLOR_SLOTS[color][5:]] if color else []
+    parts += [word for flag, word in (("b", "bold"), ("u", "underline")) if flag in attrs]
+    return ",".join(parts) or "none"
+
+
+def zsh_lines(s, note):
+    """The settings block body; empty when everything is left as is. note collects warnings."""
+    out = []
+    styles = []
+    for _label, key, hl_styles, default in ZSH_HL:
+        if s[key] == KEEP:
+            continue
+        if hl_styles is None:
+            out.append(f"ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='{zsh_style(s[key], default)}'")
+        else:
+            styles += [f"ZSH_HIGHLIGHT_STYLES[{name}]='{zsh_style(s[key], default, name)}'" for name in hl_styles]
+    if styles:
+        out += ["typeset -gA ZSH_HIGHLIGHT_STYLES", *styles]
+    case = {"insensitive": "'m:{[:lower:][:upper:]}={[:upper:][:lower:]}' 'r:|=*' 'l:|=* r:|=*'",
+            "sensitive": "'r:|=*' 'l:|=* r:|=*'"}.get(s["z_case"])
+    if case:
+        out.append(f"zstyle ':completion:*' matcher-list {case}")
+    out += {"off": ["unsetopt correct correct_all"], "commands": ["setopt correct", "unsetopt correct_all"],
+            "all": ["setopt correct_all"]}.get(s["z_correct"], [])
+    for key, option in (("z_autocd", "auto_cd"), ("z_share", "share_history"), ("z_beep", "beep")):
+        if s[key] != KEEP:
+            out.append(f"{'setopt' if s[key] == 'on' else 'unsetopt'} {option}")
+    if s["z_history"] != KEEP:
+        size = int(s["z_history"])
+        hist = os.path.join(os.path.dirname(ZSHRC), ".zsh_history")
+        try:
+            with open(hist, "rb") as f:
+                have = sum(1 for _ in f)
+        except OSError:
+            have = 0
+        if size < have:
+            # A smaller SAVEHIST cuts the history file down on the next save.
+            note.append(f"History size not changed: your history already has {have} lines.")
+        else:
+            out.append(f"HISTSIZE={size} SAVEHIST={size}")
+    if s["z_suggest_src"] != KEEP:
+        out.append(f"ZSH_AUTOSUGGEST_STRATEGY=({s['z_suggest_src']})")
+    return out
+
+
+def zsh_syntax_ok(text):
+    try:
+        return subprocess.run(["zsh", "-n"], input=text, capture_output=True, text=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def apply_zsh(s):
+    """Write our .zshrc blocks from the settings, or remove them; returns a status line."""
+    text = read(ZSHRC)
+    kept, _saved, _plugins = strip_zsh_blocks(text.splitlines())
+    info = zsh_setup(kept)
+    out = list(kept)
+    note = []
+    plugins = s["z_plugins"]
+    if info["omz"] and plugins != info["plugins"]:
+        if plugins or not info["default_if_empty"]:
+            out[info["at"]:info["at"]] = [ZSH_PLUGINS_BEGIN,
+                                          "# Managed by Kitty Styler; this list wins over any plugins= above.",
+                                          f"plugins=({' '.join(plugins)})", ZSH_PLUGINS_END]
+        else:
+            note.append("Plugins not changed: with none ticked, your zsh config loads its own default list.")
+    body = zsh_lines(s, note)
+    if body:
+        while out and not out[-1].strip():
+            out.pop()
+        state = {key: s[key] for _l, key, *_r in ZSH_KEYS}
+        out += ["", ZSH_BEGIN, "# Managed by Kitty Styler; changes here are overwritten when you press Apply.",
+                ZSH_STATE + json.dumps(state), *body, ZSH_END]
+    new = "\n".join(out) + "\n"
+    if new == text or (not text.endswith("\n") and new == text + "\n"):
+        return " ".join(note)
+    # Only refuse when the file passed before, so an odd but working .zshrc doesn't block saving.
+    if zsh_syntax_ok(text) and not zsh_syntax_ok(new):
+        return "Shell settings not saved: .zshrc would not be valid zsh."
+    if text and not os.path.exists(f"{ZSHRC}.bak-kitty-styler"):
+        shutil.copy2(ZSHRC, f"{ZSHRC}.bak-kitty-styler")
+    write_atomic(ZSHRC, new)
+    return " ".join(note + ["Shell settings saved; they apply in new shells, or run  exec zsh  in an open one."])
 
 
 class StylerApp(Gtk.Application):

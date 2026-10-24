@@ -1,7 +1,8 @@
 # Kitty Styler
 
 A small GTK4 app for picking how the [kitty](https://sw.kovidgoyal.net/kitty/) terminal looks: theme, font,
-opacity, padding, cursor, line height, tab bar and, optionally, a [starship](https://starship.rs/) prompt.
+opacity, padding, cursor, line height, tab bar and, optionally, a [starship](https://starship.rs/) prompt
+and your zsh shell (oh-my-zsh plugins, typing colours, behaviour).
 Every change shows up in a live preview before anything is written.
 
 ![Kitty Styler with the Dracula theme](docs/screenshot.png)
@@ -16,6 +17,12 @@ Every change shows up in a live preview before anything is written.
 - **Starship prompt (optional)**: segment styles (plain, bubbles, arrows, slanted, blocks), one or two
   lines, and per-part colours for the OS icon, user and host, folder, git, error code, duration,
   language versions and clock. Off by default.
+- **Shell (zsh, optional)**: tick [oh-my-zsh](https://ohmyz.sh/) plugins from a searchable list that
+  shows what each one does and the aliases it adds; pick the colours
+  [zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting) and
+  [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions) use while you type; and set
+  completion case, typo correction, auto cd, history size, shared history and the terminal beep. Every
+  option starts at "Leave as is". Rows only show for the parts your shell actually loads.
 - **Noctalia (optional)**: if [Noctalia](https://github.com/noctalia-dev/noctalia) manages your kitty
   colours, the first theme entry follows its wallpaper colours, and the app works alongside Noctalia's
   templates.
@@ -35,6 +42,12 @@ Every change shows up in a live preview before anything is written.
   table), nothing is written and the window says why. Turning the switch off and applying removes the
   block again. Your prompt settings stay saved in one comment line.
 
+- **.zshrc**: untouched while every shell option is "Leave as is" and the plugin list is unchanged.
+  Otherwise Apply writes the plugin list between `# >>> KITTY STYLER ZSH PLUGINS >>>` markers just before
+  the line that loads oh-my-zsh, and the other settings between `# >>> KITTY STYLER ZSH >>>` markers at the
+  end. It makes a one-time backup, `.zshrc.bak-kitty-styler`, and checks the result with `zsh -n` first.
+  Changes apply in new shells (or `exec zsh`). Setting everything back removes both blocks.
+
 Symlinked config files (from a dotfile manager) are written through the link.
 
 ## Requirements
@@ -44,6 +57,7 @@ Symlinked config files (from a dotfile manager) are written through the link.
   `python3-gi python3-gi-cairo gir1.2-gtk-4.0`)
 - fontconfig (`fc-list`), for the font list
 - kitty
+- Optional: zsh with oh-my-zsh, zsh-syntax-highlighting and zsh-autosuggestions
 - Optional: starship, and a [Nerd Font](https://www.nerdfonts.com/) for the prompt icons
 
 The themes come from kitty's own theme collection. If the list is empty, run `kitty +kitten themes` once and
@@ -83,15 +97,16 @@ config:
 | `KITTY_STYLER_STARSHIP` | `$STARSHIP_CONFIG`, else `~/.config/starship.toml` |
 | `KITTY_STYLER_NOCTALIA` | `~/.local/state/noctalia/settings.toml` |
 | `KITTY_STYLER_THEMES` | `~/.cache/kitty/kitty-themes.zip` |
+| `KITTY_STYLER_ZSHRC` | `$ZDOTDIR/.zshrc`, else `~/.zshrc` |
 
 Apply still sends a reload signal to every running kitty.
 
 ## Tested on
 
-CachyOS with Hyprland, kitty, starship 1.26 and Noctalia, plus test setups without Noctalia and without a
+CachyOS with Hyprland, kitty, starship 1.26, Noctalia and zsh 5.9 with CachyOS's oh-my-zsh setup, plus test setups without Noctalia and without a
 kitty config.
 
 ## License
 
 [CC0 1.0](LICENSE): no rights reserved. Themes are not included; they are read from kitty's own download at
-runtime.
+runtime. oh-my-zsh plugin descriptions and aliases are read from your own oh-my-zsh install, never bundled.
