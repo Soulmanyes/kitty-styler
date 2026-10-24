@@ -283,6 +283,31 @@ def read(path):
         return ""
 
 
+def label_factory(ellipsize):
+    """List item factory for a string DropDown. ellipsize: fixed narrow natural width, so the
+    widget stays the same size whatever text it shows; hexpand still lets it fill the row."""
+    factory = Gtk.SignalListItemFactory()
+
+    def setup(_f, item):
+        label = Gtk.Label(xalign=0)
+        if ellipsize:
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_width_chars(8)
+            label.set_max_width_chars(8)
+            label.set_hexpand(True)
+        item.set_child(label)
+
+    def bind(_f, item):
+        text = item.get_item().get_string()
+        item.get_child().set_label(text)
+        if ellipsize:
+            item.get_child().set_tooltip_text(text)
+
+    factory.connect("setup", setup)
+    factory.connect("bind", bind)
+    return factory
+
+
 def load_themes():
     """Return {name: conf text}; the Noctalia theme always comes first."""
     themes = {BASE_LABEL: None}
@@ -795,6 +820,12 @@ class StylerWindow(Gtk.ApplicationWindow):
             if len(choices) > 15 or key == "theme":
                 dd.set_enable_search(True)
                 dd.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+            # The button's label sized itself to the picked text, so stepping through a list moved
+            # the previous/next buttons out from under the mouse. Fixed width, long names ellipsized;
+            # the open list still shows them in full. Set after the search expression: setting that
+            # puts the default factory back.
+            dd.set_factory(label_factory(ellipsize=True))
+            dd.set_list_factory(label_factory(ellipsize=False))
             dd.connect("notify::selected", self.on_changed, key)
             self.dropdowns[key] = dd
             stepped = len(choices) > 6 or key == "theme"
