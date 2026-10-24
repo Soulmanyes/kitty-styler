@@ -67,23 +67,25 @@ press Esc to quit it: kitty downloads the collection into `~/.cache/kitty/kitty-
 ## Install
 
 ```sh
-git clone https://github.com/Soulmanyes/kitty-styler.git
-cd kitty-styler
-python3 kitty-styler.py
+curl -fsSL https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/install.sh | sh
 ```
 
-For a menu entry, save this as `~/.local/share/applications/kitty-styler.desktop`, with the path changed
-to where you cloned it:
+This copies the app to `~/.local/share/kitty-styler`, adds **Kitty Styler** to your app menu and a
+`kitty-styler` command to `~/.local/bin`. Run the same command again to update. Or clone the repository
+and run the script from it:
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=Kitty Styler
-Comment=Pick kitty's theme, font and look with a live preview
-Exec=python3 /path/to/kitty-styler/kitty-styler.py
-Icon=kitty
-Categories=Settings;Utility;
-StartupWMClass=io.github.soulmanyes.KittyStyler
+```sh
+git clone https://github.com/Soulmanyes/kitty-styler.git
+cd kitty-styler
+./install.sh
+```
+
+You can also run it straight from the clone, without installing: `python3 kitty-styler.py`.
+
+To remove it (your kitty config stays as it is):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/install.sh | sh -s -- --uninstall
 ```
 
 ## Testing on copies
