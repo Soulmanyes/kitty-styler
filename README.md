@@ -5,7 +5,7 @@ opacity, padding, cursor, line height, tab bar and, optionally, a [starship](htt
 and your zsh shell (oh-my-zsh plugins, typing colours, behaviour).
 Every change shows up in a live preview before anything is written.
 
-![Kitty Styler with the Dracula theme](docs/screenshot.png)
+![Kitty Styler with the Noctalia theme and a styled starship prompt](docs/screenshot.png)
 
 ## Features
 
