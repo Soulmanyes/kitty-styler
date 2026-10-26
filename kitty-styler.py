@@ -32,7 +32,7 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("PangoCairo", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 warnings.filterwarnings("ignore", ".*cairo_set_source_pixbuf", DeprecationWarning)
-from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo
 
 # updater.py sits next to this file (the command in ~/.local/bin is a symlink). A copy of
 # kitty-styler.py on its own still runs, just without the Updates section.
@@ -578,7 +578,8 @@ def load_themes():
 
 def mono_fonts():
     try:
-        out = subprocess.run(["fc-list", ":spacing=mono", "family"], capture_output=True, text=True).stdout
+        out = subprocess.run(["fc-list", ":spacing=mono", "family"], capture_output=True, text=True,
+                             check=False).stdout
     except OSError:
         out = ""
     fams = {line.split(",")[0].strip() for line in out.splitlines() if line.strip()}
@@ -824,7 +825,8 @@ def ansi_rows(text):
                         c = c if c < 16 else xterm_color(c)
                         i += 2
                     elif nums[i + 1] == 2 and i + 4 < len(nums):
-                        c = "#%02x%02x%02x" % tuple(nums[i + 2:i + 5])
+                        r, g, b = nums[i + 2:i + 5]
+                        c = f"#{r:02x}{g:02x}{b:02x}"
                         i += 4
                     else:
                         c = None
@@ -899,7 +901,7 @@ def render_shell_prompt(shell):
     if not out:
         return None
     m = re.search("\x1eN(.*?)\x1eE", out)
-    parts = re.findall("\x1eP(.*?)\x1eR(.*?)\x1eE", out, re.S)
+    parts = re.findall("\x1eP(.*?)\x1eR(.*?)\x1eE", out, re.DOTALL)
     if not m or len(parts) != len(PREVIEW_STATUSES):
         return None
     return m.group(1), {s: prompt_parts(left, right) for s, (left, right) in zip(PREVIEW_STATUSES, parts)}
@@ -1015,7 +1017,7 @@ def apply_switch(shell, on):
 def shell_syntax_ok(shell, text):
     try:
         return subprocess.run(SYNTAX_CHECK[shell], input=text, capture_output=True, text=True,
-                              timeout=10).returncode == 0
+                              timeout=10, check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -2845,10 +2847,10 @@ def write_atomic(path, text):
 def set_noctalia_starship(enable, dry_run=False):
     """Add or remove "starship" in Noctalia's [theme.templates] builtin_ids. Returns True if it (would have) changed."""
     text = read(NOCTALIA_SETTINGS)
-    sec = re.search(r"^\s*\[theme\.templates\]\s*$", text, re.M)
+    sec = re.search(r"^\s*\[theme\.templates\]\s*$", text, re.MULTILINE)
     if not sec:
         return False
-    arr = re.compile(r"^(\s*)builtin_ids\s*=\s*\[(.*?)\]", re.M | re.S).search(text, sec.end())
+    arr = re.compile(r"^(\s*)builtin_ids\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL).search(text, sec.end())
     if not arr:
         return False
     body = arr.group(2)
@@ -2885,8 +2887,8 @@ def starship_palette(theme_colors, starship_text):
     """Same colour names as the Noctalia palette, each filled from the matching slot of the kitty theme."""
     noctalia = parse_conf(read(NOCTALIA_THEME))
     slots = [f"color{i}" for i in range(16)] + ["foreground", "background"]
-    m = re.search(r"^\[palettes\.noctalia\]\s*$(.*?)(?=^\[|^# <<<|\Z)", starship_text, re.M | re.S)
-    names = re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', m.group(1), re.M) if m else []
+    m = re.search(r"^\[palettes\.noctalia\]\s*$(.*?)(?=^\[|^# <<<|\Z)", starship_text, re.MULTILINE | re.DOTALL)
+    names = re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', m.group(1), re.MULTILINE) if m else []
     out = {}
     for name, value in names:
         slot = next((s for s in slots if noctalia.get(s, "").lower() == value.lower()), "foreground")
@@ -3016,14 +3018,14 @@ def zsh_setup(lines):
             info["at"] = i
             break
         text = read(expand_path(path))
-        if re.search(r"^\s*(?:source|\.)\s+\S*oh-my-zsh\.sh", text, re.M):
+        if re.search(r"^\s*(?:source|\.)\s+\S*oh-my-zsh\.sh", text, re.MULTILINE):
             info["at"], loader = i, text
             break
     before = "\n".join(lines[:info["at"]] if info["at"] is not None else lines)
     info["text"] = "\n".join(lines) + "\n" + loader
     for name, var in (("dir", "ZSH"), ("custom", "ZSH_CUSTOM")):
         for text in (before, loader):
-            found = re.findall(rf"^\s*(?:export\s+)?{var}=(\S+)", text, re.M)
+            found = re.findall(rf"^\s*(?:export\s+)?{var}=(\S+)", text, re.MULTILINE)
             if found:
                 info[name] = expand_path(found[-1])
                 break
@@ -3032,7 +3034,7 @@ def zsh_setup(lines):
                             if os.path.isdir(d)), None)
     if info["dir"] and not info["custom"]:
         info["custom"] = os.path.join(info["dir"], "custom")
-    plugins_re = re.compile(r"(?:^|&&)[ \t]*plugins=\(([^)]*)\)", re.M | re.S)
+    plugins_re = re.compile(r"(?:^|&&)[ \t]*plugins=\(([^)]*)\)", re.MULTILINE | re.DOTALL)
     for text in (before, loader):
         found = list(plugins_re.finditer(text))
         if found:
@@ -3080,7 +3082,7 @@ def omz_plugins(info):
             name = os.path.basename(plugin_dir)
             if name == "example" or os.path.basename(script) != f"{name}.plugin.zsh":
                 continue
-            aliases = re.findall(r"^\s*alias\s+(?:-[gs]\s+)?['\"]?([^=\s'\"]+)=", read(script), re.M)
+            aliases = re.findall(r"^\s*alias\s+(?:-[gs]\s+)?['\"]?([^=\s'\"]+)=", read(script), re.MULTILINE)
             out[name] = (readme_summary(os.path.join(plugin_dir, "README.md")), list(dict.fromkeys(aliases)))
     return dict(sorted(out.items()))
 
@@ -3147,7 +3149,7 @@ def zsh_lines(s, note):
 def zsh_syntax_ok(text):
     try:
         return subprocess.run(["zsh", "-n"], input=text, capture_output=True, text=True,
-                              timeout=10).returncode == 0
+                              timeout=10, check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
