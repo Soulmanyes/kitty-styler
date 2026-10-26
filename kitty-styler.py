@@ -1043,7 +1043,108 @@ def shell_syntax_ok(shell, text):
         return False
 
 
-KITTY_SHELL = kitty_shell(parse_conf_file(CONF))
+class KittyTerminal:
+    """The terminal whose config the app edits. Settings use kitty's option names; each terminal
+    maps them to its own config."""
+
+    name = "kitty"
+    noctalia = NOCTALIA
+
+    def read_conf(self, without_theme=False):
+        """What the terminal uses now, includes followed; without_theme leaves out our theme file."""
+        return parse_conf_file(CONF, skip={os.path.realpath(STYLER_THEME)} if without_theme else ())
+
+    def theme(self):
+        """(name, text) of the theme the app wrote, or (None, "") when it wrote none."""
+        if STYLER_INCLUDE not in read(CONF).splitlines():
+            return None, ""
+        text = read(STYLER_THEME)
+        m = re.match(r"# Theme: (.+)", text)
+        return (m and m.group(1).strip()), (text.split("\n", 2)[2] if text.count("\n") >= 2 else "")
+
+    def noctalia_colors(self):
+        return parse_conf(read(NOCTALIA_THEME))
+
+    def shell(self):
+        return kitty_shell(parse_conf_file(CONF))
+
+    def write(self, s, themes, file_conf):
+        """Write kitty.conf and the theme file; returns the backup path or None."""
+        style, pl = TAB_STYLES[s["tab_bar"]]
+        wanted = {"font_family": s["font_family"], "tab_bar_style": style}
+        if pl:
+            wanted["tab_powerline_style"] = pl
+        defaults = {"font_family": "monospace", "tab_bar_style": "fade", "tab_powerline_style": "angled"}
+        for _label, key, _choices, default in OPTIONS:
+            wanted[key] = s[key]
+            defaults[key] = default
+        # Swap only the effect and trail names the app loaded (the first of each), in place; any other
+        # custom_shaders names, a second effect included, stay as they are.
+        shaders = file_conf.get("custom_shaders", "").split()
+        for table, key in ((EFFECTS, "effect"), (TRAIL_STYLES, "trail_style")):
+            new = table.get(s[key])
+            i = shader_pick(shaders, table)[0]
+            if i is None:
+                shaders += [new] if new else []
+            elif new:
+                shaders[i] = new
+            else:
+                del shaders[i]
+        wanted["custom_shaders"] = " ".join(shaders)
+        defaults["custom_shaders"] = ""
+        # Only write keys already in kitty.conf itself, or ones changed from what kitty uses now. A key that
+        # only an included theme sets (Noctalia's cursor_trail_color) stays the theme's, so it keeps following it.
+        own = parse_conf(read(CONF))
+        wanted = {k: v for k, v in wanted.items()
+                  if k in own or not same(v, file_conf.get(k, defaults[k]))}
+
+        os.makedirs(KITTY_DIR, exist_ok=True)
+        text = read(CONF)
+        backup = None
+        if text:
+            backup = f"{CONF}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(CONF, backup)
+            prune_backups()
+
+        out, in_block, done = [], False, set()
+        for line in text.splitlines():
+            if line.strip().startswith("# BEGIN_KITTY_STYLER"):
+                in_block = True
+                continue
+            if in_block:
+                if line.strip() == BLOCK_END:
+                    in_block = False
+                continue
+            m = re.match(r"^(\s*)(modify_font\s+\w+|\w+)(\s+)", line)
+            key = m and re.sub(r"\s+", " ", m.group(2))
+            if key in wanted:
+                done.add(key)
+                if not wanted[key]:
+                    # kitty rejects a key with no value (an emptied custom_shaders list); drop the line.
+                    continue
+                line = f"{m.group(1)}{key}{m.group(3)}{wanted[key]}"
+            out.append(line)
+        while out and not out[-1].strip():
+            out.pop()
+
+        extra = [f"{k} {v}" for k, v in wanted.items() if k not in done and v]
+        if s["theme"] != BASE_LABEL:
+            os.makedirs(os.path.dirname(STYLER_THEME), exist_ok=True)
+            with open(STYLER_THEME, "w", encoding="utf-8") as f:
+                f.write(f"# Theme: {s['theme']}\n# Written by kitty-styler from kitty's theme collection.\n")
+                f.write(themes[s["theme"]])
+            extra.append(STYLER_INCLUDE)
+        if extra:
+            out += ([""] if out else []) + [BLOCK_BEGIN, *extra, BLOCK_END]
+        write_atomic(CONF, "\n".join(out) + "\n")
+        return backup
+
+    def reload(self):
+        subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
+
+
+TERMINAL = KittyTerminal()
+KITTY_SHELL = TERMINAL.shell()
 # The Shell (zsh) section edits .zshrc, which only matters when kitty runs zsh.
 ZSH_AVAILABLE = ZSH_AVAILABLE and KITTY_SHELL == "zsh"
 
@@ -2300,10 +2401,9 @@ class StylerWindow(Gtk.ApplicationWindow):
 
     # ---- state ----
     def load_current(self):
-        text = read(CONF)
-        conf = parse_conf_file(CONF)
-        # The colours kitty has without our theme file, for "Keep current theme".
-        self.base_colors = parse_conf_file(CONF, skip={os.path.realpath(STYLER_THEME)})
+        conf = TERMINAL.read_conf()
+        # The colours the terminal has without our theme file, for "Keep current theme".
+        self.base_colors = TERMINAL.read_conf(without_theme=True)
         s = {"font_family": conf.get("font_family", "monospace")}
         for _label, key, _choices, default in OPTIONS:
             s[key] = conf.get(key, default)
@@ -2315,14 +2415,11 @@ class StylerWindow(Gtk.ApplicationWindow):
         s["trail_style"] = shader_pick(shaders, TRAIL_STYLES)[1] or "plain"
         s["effect"] = shader_pick(shaders, EFFECTS)[1] or "none"
         s["theme"] = BASE_LABEL
-        if STYLER_INCLUDE in text.splitlines():
-            theme_text = read(STYLER_THEME)
-            m = re.match(r"# Theme: (.+)", theme_text)
-            name = m and m.group(1).strip()
-            if name and name.startswith(SHARED_THEME) and name not in self.themes:
-                self.add_shared_theme(name, theme_text.split("\n", 2)[2] if theme_text.count("\n") >= 2 else "")
-            if name in self.themes:
-                s["theme"] = name
+        name, theme_text = TERMINAL.theme()
+        if name and name.startswith(SHARED_THEME) and name not in self.themes:
+            self.add_shared_theme(name, theme_text)
+        if name in self.themes:
+            s["theme"] = name
         s.update(load_prompt_settings())
         styled = PROMPT_BEGIN in read(STARSHIP_CONF).splitlines()
         uses_starship = (not KITTY_SHELL or own_starship(KITTY_SHELL)
@@ -2528,7 +2625,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             return
         if not colors:
             # A code without colours (Kitty Styler 1.2.0).
-            if value is None and data.get("noctalia") and NOCTALIA:
+            if value is None and data.get("noctalia") and TERMINAL.noctalia:
                 values["theme"] = BASE_LABEL
             elif value is None:
                 notes.append("The sharer's colours aren't in the code. Your colours stay.")
@@ -2540,7 +2637,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         else:
             label = "their Noctalia colours" if data.get("noctalia") else "their colours"
         text = "".join(f"{k} {v}\n" for k, v in colors.items())
-        ask = value is None and data.get("noctalia") and NOCTALIA
+        ask = value is None and data.get("noctalia") and TERMINAL.noctalia
         if ask:
             options.append(("exact_colours", ("Use their exact colours. Otherwise Noctalia picks colours from "
                                               "your wallpaper, like it does for them."), True))
@@ -2656,7 +2753,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         name = self.settings["theme"]
         if name != BASE_LABEL:
             return parse_conf(self.themes[name])
-        return parse_conf(read(NOCTALIA_THEME)) if NOCTALIA else self.base_colors
+        return TERMINAL.noctalia_colors() if TERMINAL.noctalia else self.base_colors
 
     def make_code(self):
         starship = None
@@ -2681,7 +2778,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                     "its theme collection, then press Reload themes.")
         elif name == BASE_LABEL:
             note = ""
-        elif NOCTALIA:
+        elif TERMINAL.noctalia:
             note = ("Kitty and the starship prompt will stop following Noctalia's wallpaper colours. "
                     "Pick Noctalia again to go back.")
         else:
@@ -3007,7 +3104,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             self.settings.pop("shared_starship", None)
         except OSError as e:
             msg = f"Could not save: {e}"
-        self.file_conf = parse_conf_file(CONF)
+        self.file_conf = TERMINAL.read_conf()
         self.status.set_label(msg)
         self.renders.clear()
         self.render_gen += 1
@@ -3134,7 +3231,7 @@ def make_share_code(settings, colors=None, starship=None):
     data = {k: v for k, v in settings.items() if k != "shared_starship"}
     if data.get("theme") == BASE_LABEL:
         data["theme"] = None
-    payload = {"settings": data, "noctalia": NOCTALIA, "colors": colors or {}}
+    payload = {"settings": data, "noctalia": TERMINAL.noctalia, "colors": colors or {}}
     if starship:
         payload["starship"] = starship
     blob = json.dumps(payload, separators=(",", ":")).encode()
@@ -3211,80 +3308,12 @@ def prune_backups():
 
 
 def apply_all(s, themes, colors, file_conf, reload=True):
-    """Write kitty.conf, the theme file and starship.toml from the settings; returns a status message."""
-    style, pl = TAB_STYLES[s["tab_bar"]]
-    wanted = {"font_family": s["font_family"], "tab_bar_style": style}
-    if pl:
-        wanted["tab_powerline_style"] = pl
-    defaults = {"font_family": "monospace", "tab_bar_style": "fade", "tab_powerline_style": "angled"}
-    for _label, key, _choices, default in OPTIONS:
-        wanted[key] = s[key]
-        defaults[key] = default
-    # Swap only the effect and trail names the app loaded (the first of each), in place; any other
-    # custom_shaders names, a second effect included, stay as they are.
-    shaders = file_conf.get("custom_shaders", "").split()
-    picked = []
-    for table, key in ((EFFECTS, "effect"), (TRAIL_STYLES, "trail_style")):
-        new = table.get(s[key])
-        i = shader_pick(shaders, table)[0]
-        if i is None:
-            shaders += [new] if new else []
-        elif new:
-            shaders[i] = new
-        else:
-            del shaders[i]
-        picked.append(new)
-    wanted["custom_shaders"] = " ".join(shaders)
-    defaults["custom_shaders"] = ""
-    # Only write keys already in kitty.conf itself, or ones changed from what kitty uses now. A key that
-    # only an included theme sets (Noctalia's cursor_trail_color) stays the theme's, so it keeps following it.
-    own = parse_conf(read(CONF))
-    wanted = {k: v for k, v in wanted.items()
-              if k in own or not same(v, file_conf.get(k, defaults[k]))}
-
-    os.makedirs(KITTY_DIR, exist_ok=True)
-    text = read(CONF)
-    backup = None
-    if text:
-        backup = f"{CONF}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-        shutil.copy2(CONF, backup)
-        prune_backups()
-
-    out, in_block, done = [], False, set()
-    for line in text.splitlines():
-        if line.strip().startswith("# BEGIN_KITTY_STYLER"):
-            in_block = True
-            continue
-        if in_block:
-            if line.strip() == BLOCK_END:
-                in_block = False
-            continue
-        m = re.match(r"^(\s*)(modify_font\s+\w+|\w+)(\s+)", line)
-        key = m and re.sub(r"\s+", " ", m.group(2))
-        if key in wanted:
-            done.add(key)
-            if not wanted[key]:
-                # kitty rejects a key with no value (an emptied custom_shaders list); drop the line.
-                continue
-            line = f"{m.group(1)}{key}{m.group(3)}{wanted[key]}"
-        out.append(line)
-    while out and not out[-1].strip():
-        out.pop()
-
-    extra = [f"{k} {v}" for k, v in wanted.items() if k not in done and v]
-    if s["theme"] != BASE_LABEL:
-        os.makedirs(os.path.dirname(STYLER_THEME), exist_ok=True)
-        with open(STYLER_THEME, "w", encoding="utf-8") as f:
-            f.write(f"# Theme: {s['theme']}\n# Written by kitty-styler from kitty's theme collection.\n")
-            f.write(themes[s["theme"]])
-        extra.append(STYLER_INCLUDE)
-    if extra:
-        out += ([""] if out else []) + [BLOCK_BEGIN, *extra, BLOCK_END]
-    write_atomic(CONF, "\n".join(out) + "\n")
-
+    """Write the terminal's config, the theme file and starship.toml from the settings; returns a status message."""
+    backup = TERMINAL.write(s, themes, file_conf)
+    picked = [EFFECTS.get(s["effect"]), TRAIL_STYLES.get(s["trail_style"])]
     if reload:
-        subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
-    msg = ["Applied and reloaded open kitty windows."]
+        TERMINAL.reload()
+    msg = [f"Applied and reloaded open {TERMINAL.name} windows."]
     if backup:
         msg.append(f"Backup: {backup}")
     if any(picked) and not SLANGC:
@@ -3303,10 +3332,10 @@ def apply_all(s, themes, colors, file_conf, reload=True):
     if KITTY_SHELL and mode:
         msg.append(apply_switch(KITTY_SHELL, mode != "base" and bool(STARSHIP_BIN)
                                 and not own_starship(KITTY_SHELL)))
-    if NOCTALIA or STARSHIP_BEGIN in read(STARSHIP_CONF).splitlines():
+    if TERMINAL.noctalia or STARSHIP_BEGIN in read(STARSHIP_CONF).splitlines():
         # Without Noctalia the prompt's colour names already follow kitty's colours; this
         # branch then only cleans up a palette left from before.
-        msg.append(apply_starship(s["theme"] if NOCTALIA else BASE_LABEL, colors))
+        msg.append(apply_starship(s["theme"] if TERMINAL.noctalia else BASE_LABEL, colors))
     if ZSH_AVAILABLE:
         msg.append(apply_zsh(s))
     return "\n".join(m for m in msg if m)
@@ -3526,7 +3555,7 @@ def set_noctalia_starship(enable, dry_run=False):
 
 def starship_palette(theme_colors, starship_text):
     """Same colour names as the Noctalia palette, each filled from the matching slot of the kitty theme."""
-    noctalia = parse_conf(read(NOCTALIA_THEME))
+    noctalia = TERMINAL.noctalia_colors()
     slots = [f"color{i}" for i in range(16)] + ["foreground", "background"]
     m = re.search(r"^\[palettes\.noctalia\]\s*$(.*?)(?=^\[|^# <<<|\Z)", starship_text, re.MULTILINE | re.DOTALL)
     names = re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', m.group(1), re.MULTILINE) if m else []
@@ -3575,7 +3604,7 @@ def apply_starship(theme, colors):
         if turned_off:
             # Noctalia's apply hook puts its own palette line and colours back.
             set_noctalia_starship(True)
-        return "Starship is back on Noctalia's colours." if NOCTALIA else "Starship palette put back."
+        return "Starship is back on Noctalia's colours." if TERMINAL.noctalia else "Starship palette put back."
 
     palette = starship_palette(colors, text)
     palette_re = re.compile(r"^\s*palette\s*=")
@@ -3915,7 +3944,7 @@ def try_apply(tmp):
         data = json.load(f)
     themes = load_themes()
     themes.update(data.get("themes", {}))
-    apply_all(data["settings"], themes, data["colors"], parse_conf_file(CONF), reload=False)
+    apply_all(data["settings"], themes, data["colors"], TERMINAL.read_conf(), reload=False)
     return 0
 
 
