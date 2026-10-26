@@ -3,16 +3,19 @@
 import glob
 import json
 import os
+import platform
 import pwd
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import tomllib
+import urllib.request
 import warnings
 import zipfile
 
@@ -47,7 +50,6 @@ STARSHIP_PREV = "# kitty-styler previous palette line: "
 # Used when starship.toml has no Noctalia palette to copy names from.
 BASIC_PALETTE = {"black": "color0", "red": "color1", "green": "color2", "yellow": "color3", "blue": "color4",
                  "magenta": "color5", "purple": "color5", "cyan": "color6", "white": "color7"}
-STARSHIP_AVAILABLE = os.path.exists(STARSHIP_CONF) or shutil.which("starship") is not None
 BLOCK_BEGIN = "# BEGIN_KITTY_STYLER (managed by kitty-styler; keep this block last so it wins)"
 BLOCK_END = "# END_KITTY_STYLER"
 # Noctalia's kitty template keeps a wallpaper-coloured theme here; without it, the first
@@ -79,19 +81,210 @@ TAB_STYLES = {
     "hidden": ("hidden", None),
 }
 
-# (label, kitty key, choices, kitty default). Choices are the strings written to kitty.conf.
-OPTIONS = [
-    ("Font size", "font_size", [f"{s:.1f}" for s in [8, 9, 10, 10.5, 11, 11.5, 12, 12.5, 13, 14, 15, 16, 18, 20, 22, 24]], "11.0"),
-    ("Background opacity", "background_opacity", [f"{i / 100:.2f}" for i in range(30, 101, 5)], "1.00"),
-    ("Window padding", "window_padding_width", ["0", "2", "4", "6", "8", "10", "12", "15", "20", "25", "30", "40"], "0"),
-    ("Cursor shape", "cursor_shape", ["block", "beam", "underline"], "block"),
-    ("Cursor blink", "cursor_blink_interval", ["-1", "0", "0.3", "0.5", "0.8", "1.2"], "-1"),
-    ("Cursor trail", "cursor_trail", ["0", "1", "3", "10", "30"], "0"),
-    ("Line height", "modify_font cell_height", ["90%", "100%", "105%", "110%", "115%", "120%", "130%", "140%"], "100%"),
-    ("Letter spacing", "modify_font cell_width", ["90%", "95%", "100%", "105%", "110%", "120%"], "100%"),
-    ("Tab bar position", "tab_bar_edge", ["bottom", "top"], "bottom"),
-    ("Tab bar alignment", "tab_bar_align", ["left", "center", "right"], "left"),
+
+def kitty_shaders():
+    """Names of the shader pipelines this kitty ships (kitty 0.49+), plus the user's own."""
+    dirs = [os.path.join(KITTY_DIR, "shaders")]
+    exe = shutil.which("kitty")
+    if exe:
+        # Distro packages and kitty.app both keep the Python package in ../lib/kitty/kitty.
+        dirs.append(os.path.join(os.path.dirname(os.path.realpath(exe)), "..", "lib", "kitty", "kitty",
+                                 "shaders", "custom"))
+    return {os.path.basename(p)[:-len(".pipeline")] for d in dirs for p in glob.glob(os.path.join(d, "*.pipeline"))}
+
+
+# Trail looks and effects are names in kitty's custom_shaders list. Apply swaps only the names
+# picked here and keeps any others. The trail looks still need cursor_trail above 0.
+TRAIL_STYLES = {"plain": None, "blaze": "cursor-trail-blaze", "lightning": "cursor-trail-lightning",
+                "motion blur": "cursor-trail-motion-blur"}
+SHADERS = kitty_shaders()
+TRAIL_STYLES = {k: v for k, v in TRAIL_STYLES.items() if v is None or v in SHADERS}
+TRAIL_SHADERS = set(TRAIL_STYLES.values()) | {"cursor-trail-default"}
+EFFECTS = {"none": None, **{n: n for n in sorted(SHADERS - TRAIL_SHADERS)}}
+# Extra programs some options need. Installed with the distro's package manager where it has them
+# (Arch-based: pacman, behind a password prompt), else downloaded from the project's GitHub release
+# into ~/.local/share/kitty-styler/extras and linked into ~/.local/bin, which needs no password.
+HOME_BIN = os.path.expanduser("~/.local/bin")
+EXTRAS_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+                          "kitty-styler", "extras")
+EXTRAS = {
+    "slangc": {"what": "kitty's shader compiler, for trail styles and effects", "pacman": "shader-slang",
+               "repo": "shader-slang/slang", "asset": "slang-{version}-linux-{arch}-glibc-2.28.tar.gz",
+               "bin": "bin/slangc"},
+    "starship": {"what": "the prompt engine, for prompt styling", "pacman": "starship",
+                 "repo": "starship/starship", "asset": "starship-{arch}-unknown-linux-musl.tar.gz",
+                 "bin": "starship"},
+}
+
+
+def find_extra(name):
+    """Path of an installed extra, or None."""
+    if name == "slangc":
+        # kitty's own binary bundle ships slangc next to kitty.
+        exe = shutil.which("kitty")
+        bundled = exe and os.path.join(os.path.dirname(os.path.realpath(exe)), "slangc")
+        if bundled and os.access(bundled, os.X_OK):
+            return bundled
+    return shutil.which(name)
+
+
+def install_extra(name, gui=True):
+    """Install an extra; returns (ok, message). gui asks for the password with pkexec, else sudo."""
+    info = EXTRAS[name]
+    pkg = info["pacman"]
+    asker = shutil.which("pkexec") if gui else shutil.which("sudo")
+    if asker and shutil.which("pacman") and subprocess.run(["pacman", "-Si", pkg], capture_output=True,
+                                                            check=False).returncode == 0:
+        r = subprocess.run([asker, "pacman", "-S", "--needed", "--noconfirm", pkg], check=False,
+                           capture_output=gui, text=True)
+        if r.returncode == 0:
+            return True, f"Installed {name} (package {pkg})."
+        if gui and r.returncode == 126:
+            return False, f"{name} not installed: the password prompt was closed."
+        # Only fall back to the download when no password prompt could be shown (no polkit agent);
+        # after other pacman errors a second, untracked copy in ~/.local/bin would only confuse.
+        if not (gui and r.returncode == 127):
+            return False, f"Could not install {name}: pacman failed. Try: sudo pacman -S {pkg}"
+    try:
+        return True, download_extra(name)
+    except Exception as e:  # noqa: BLE001 - network, archive and file errors all end up as a message
+        return False, f"Could not install {name}: {e}"
+
+
+def download_extra(name):
+    info = EXTRAS[name]
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine())
+    if not arch:
+        raise ValueError(f"no download for this CPU ({platform.machine()})")
+    api = f"https://api.github.com/repos/{info['repo']}/releases/latest"
+    with urllib.request.urlopen(api, timeout=30) as r:
+        release = json.load(r)
+    version = release["tag_name"].lstrip("v")
+    asset = info["asset"].format(version=version, arch=arch)
+    url = next((a["browser_download_url"] for a in release["assets"] if a["name"] == asset), None)
+    if not url:
+        raise ValueError(f"the {release['tag_name']} release has no {asset}")
+    os.makedirs(EXTRAS_DIR, exist_ok=True)
+    dest = os.path.join(EXTRAS_DIR, name)
+    with tempfile.TemporaryDirectory(dir=EXTRAS_DIR) as tmp:
+        archive = os.path.join(tmp, asset)
+        urllib.request.urlretrieve(url, archive)
+        unpacked = os.path.join(tmp, "unpacked")
+        with tarfile.open(archive) as tar:
+            try:
+                tar.extractall(unpacked, filter="data")
+            except TypeError:
+                # Python before 3.11.4 has no extraction filters: refuse paths leaving the folder.
+                for m in tar.getmembers():
+                    for target in (m.name, os.path.join(os.path.dirname(m.name), m.linkname) if m.issym() else ""):
+                        if target and (os.path.isabs(target) or ".." in os.path.normpath(target).split(os.sep)):
+                            raise ValueError(f"unsafe path in {asset}: {m.name}") from None
+                tar.extractall(unpacked)
+        if not os.access(os.path.join(unpacked, info["bin"]), os.X_OK):
+            raise ValueError(f"{info['bin']} missing from {asset}")
+        shutil.rmtree(dest, ignore_errors=True)
+        os.rename(unpacked, dest)
+    os.makedirs(HOME_BIN, exist_ok=True)
+    link = os.path.join(HOME_BIN, name)
+    if os.path.lexists(link) and not os.path.islink(link):
+        return f"Downloaded {name} {version} to {dest}, but left the existing {link} alone."
+    if os.path.islink(link):
+        os.remove(link)
+    os.symlink(os.path.join(dest, info["bin"]), link)
+    msg = f"Installed {name} {version} into {HOME_BIN}."
+    if HOME_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+        msg += f" {HOME_BIN} is not on your PATH; add it so kitty and your shell find {name}."
+    return msg
+
+
+SLANGC = find_extra("slangc")
+STARSHIP_AVAILABLE = os.path.exists(STARSHIP_CONF) or find_extra("starship") is not None
+SLANG_NOTE = "Trail styles and effects need kitty's shader compiler, slangc."
+
+
+def shader_pick(names, table):
+    """Index and setting of the first name in a custom_shaders list that table offers, else (None, None)."""
+    rev = {v: k for k, v in table.items() if v}
+    return next(((i, rev[n]) for i, n in enumerate(names) if n in rev), (None, None))
+
+
+FONT_CHOICES = None  # filled in with the installed monospace fonts
+OFF_SCROLLBAR = "never"
+
+# Headings, then (label, kitty key, choices, kitty default). Choices are the strings written to kitty.conf.
+OPTION_GROUPS = [
+    ("Text", [
+        ("Font size", "font_size", [f"{s:.1f}" for s in [8, 9, 10, 10.5, 11, 11.5, 12, 12.5, 13, 14, 15, 16, 18, 20, 22, 24]], "11.0"),
+        ("Bold font", "bold_font", FONT_CHOICES, "auto"),
+        ("Italic font", "italic_font", FONT_CHOICES, "auto"),
+        ("Bold italic font", "bold_italic_font", FONT_CHOICES, "auto"),
+        ("Ligatures", "disable_ligatures", ["never", "cursor", "always"], "never"),
+        ("Line height", "modify_font cell_height", ["90%", "100%", "105%", "110%", "115%", "120%", "130%", "140%"], "100%"),
+        ("Letter spacing", "modify_font cell_width", ["90%", "95%", "100%", "105%", "110%", "120%"], "100%"),
+    ]),
+    ("Window", [
+        ("Background opacity", "background_opacity", [f"{i / 100:.2f}" for i in range(30, 101, 5)], "1.00"),
+        ("Window padding", "window_padding_width", ["0", "2", "4", "6", "8", "10", "12", "15", "20", "25", "30", "40"], "0"),
+        ("Window margin", "window_margin_width", ["0", "2", "4", "6", "8", "10", "15", "20"], "0"),
+        ("Border width", "window_border_width", ["0.5pt", "1pt", "1.5pt", "2pt", "3pt", "4pt"], "0.5pt"),
+        ("Borders", "draw_minimal_borders", ["yes", "no"], "yes"),
+        ("Border corners", "window_border_radius", ["0", "4", "8", "12", "16"], "0"),
+        ("Inactive window text", "inactive_text_alpha", ["1.0", "0.9", "0.8", "0.7", "0.6", "0.5", "0.4"], "1.0"),
+        ("Title bar", "hide_window_decorations", ["no", "titlebar-only", "yes"], "no"),
+    ]),
+    ("Cursor", [
+        ("Cursor shape", "cursor_shape", ["block", "beam", "underline"], "block"),
+        ("When unfocused", "cursor_shape_unfocused", ["hollow", "block", "beam", "underline", "unchanged"], "hollow"),
+        ("Beam thickness", "cursor_beam_thickness", ["1.0", "1.5", "2.0", "2.5", "3.0", "4.0"], "1.5"),
+        ("Underline thickness", "cursor_underline_thickness", ["1.0", "2.0", "3.0", "4.0"], "2.0"),
+        ("Cursor blink", "cursor_blink_interval", ["-1", "0", "0.3", "0.5", "0.8", "1.2"], "-1"),
+        ("Stop blinking after", "cursor_stop_blinking_after", ["0", "5", "15", "30", "60"], "15.0"),
+        ("Cursor trail", "cursor_trail", ["0", "1", "3", "10", "30"], "0"),
+        ("Trail speed", "cursor_trail_decay", ["0.05 0.2", "0.1 0.4", "0.2 0.6", "0.3 1.0"], "0.1 0.4"),
+        ("Trail start distance", "cursor_trail_start_threshold", ["0", "1", "2", "3", "5", "10"], "2"),
+        ("Trail colour", "cursor_trail_color", ["none", "white", "red", "orange", "gold", "limegreen", "cyan",
+                                                "dodgerblue", "violet", "hotpink"], "none"),
+    ]),
+    ("Tab bar", [
+        ("Tab bar position", "tab_bar_edge", ["bottom", "top"], "bottom"),
+        ("Tab bar alignment", "tab_bar_align", ["left", "center", "right"], "left"),
+        ("Show tab bar from", "tab_bar_min_tabs", ["1", "2", "3"], "2"),
+        ("Side margins", "tab_bar_margin_width", ["0.0", "2.0", "4.0", "6.0", "8.0", "10.0"], "0.0"),
+        ("Top/bottom margins", "tab_bar_margin_height", ["0.0 0.0", "2.0 2.0", "4.0 4.0", "6.0 6.0",
+                                                         "0.0 4.0", "4.0 0.0"], "0.0 0.0"),
+        ("Active tab text", "active_tab_font_style", ["normal", "bold", "italic", "bold-italic"], "bold-italic"),
+        ("Inactive tab text", "inactive_tab_font_style", ["normal", "bold", "italic", "bold-italic"], "normal"),
+    ]),
+    ("Scrollbar", [
+        ("Show scrollbar", "scrollbar", ["scrolled", "always", "never", "hovered", "scrolled-or-hovered",
+                                         "scrolled-and-hovered"], "scrolled"),
+        ("Scrollbar width", "scrollbar_width", ["0.25", "0.5", "0.75", "1.0"], "0.5"),
+        ("Handle opacity", "scrollbar_handle_opacity", ["0.2", "0.3", "0.5", "0.7", "0.9", "1.0"], "0.5"),
+        ("Handle corners", "scrollbar_radius", ["0.0", "0.1", "0.2", "0.3", "0.5"], "0.3"),
+        ("Handle colour", "scrollbar_handle_color", ["foreground", "selection_background", "white", "cyan",
+                                                     "dodgerblue", "violet", "hotpink", "orange"], "foreground"),
+        ("Track opacity", "scrollbar_track_opacity", ["0", "0.1", "0.2", "0.3", "0.5"], "0"),
+    ]),
 ]
+OPTIONS = [o for _heading, opts in OPTION_GROUPS for o in opts]
+# Rows that only matter while another setting is on: key -> (value that turns it off, rows to hide).
+DEPENDS = {"cursor_trail": ("0", ("trail_style", "cursor_trail_decay", "cursor_trail_start_threshold",
+                                  "cursor_trail_color")),
+           "scrollbar": (OFF_SCROLLBAR, ("scrollbar_width", "scrollbar_handle_opacity", "scrollbar_radius",
+                                         "scrollbar_handle_color", "scrollbar_track_opacity"))}
+DEPENDENT = {k: parent for parent, (_off, keys) in DEPENDS.items() for k in keys}
+# Notes shown under a row.
+ROW_NOTES = {
+    "cursor_trail_color": "The trail only shows when the cursor moves; not drawn in the preview.",
+    "scrollbar_track_opacity": "The scrollbar is not drawn in the preview.",
+}
+# Under the last Window row, which is Effect when this kitty has effects.
+ROW_NOTES["effect" if len(EFFECTS) > 1 else "hide_window_decorations"] = (
+    "Bold and italic fonts, borders, faded text, title bar and effects are not drawn in the preview. "
+    "Title bar changes show in new kitty windows.")
+if len(EFFECTS) > 1:
+    ROW_NOTES["effect"] += (" Animated effects (matrix, fireworks, northern lights, spotlight) redraw all the time"
+                            " and use more power.")
 # Starship prompt. Colours are ANSI names, so they follow the kitty theme (and the Noctalia palette).
 PROMPT_BEGIN = "# >>> KITTY STYLER PROMPT >>>"
 PROMPT_END = "# <<< KITTY STYLER PROMPT <<<"
@@ -227,11 +420,42 @@ ZSH_OPTIONS += [
     ("Terminal beep", "z_beep", list(ON_OFF), ON_OFF, None),
 ]
 ZSH_KEYS = [o for o in ZSH_OPTIONS if o[1]]
-TOP_HEADINGS = ("Prompt", "Shell (zsh)")
+TOP_HEADINGS = ("Prompt", "Shell (zsh)", *(heading for heading, _opts in OPTION_GROUPS))
 # Commands the preview shows as not found.
 PREVIEW_UNKNOWN = {"sl"}
 CHOICE_NOTES = {"cursor_blink_interval": {"-1": "-1 (system default)", "0": "0 (no blink)"},
-                "cursor_trail": {"0": "0 (off)"}}
+                "cursor_trail": {"0": "0 (off)"},
+                "cursor_trail_decay": {"0.05 0.2": "Fast", "0.1 0.4": "Normal", "0.2 0.6": "Slow",
+                                       "0.3 1.0": "Slower"},
+                "cursor_trail_start_threshold": {"0": "Any move", "1": "1 cell", "2": "2 cells",
+                                                 "3": "3 cells", "5": "5 cells", "10": "10 cells"},
+                "cursor_trail_color": {"none": "Cursor colour"},
+                "trail_style": {"plain": "Plain (kitty's own)", "blaze": "Blaze", "lightning": "Lightning",
+                                "motion blur": "Motion blur"},
+                "effect": {k: "None" if v is None else k.replace("-", " ").capitalize() for k, v in EFFECTS.items()},
+                "bold_font": {"auto": "Auto (from the font)"},
+                "italic_font": {"auto": "Auto (from the font)"},
+                "bold_italic_font": {"auto": "Auto (from the font)"},
+                "disable_ligatures": {"never": "On", "cursor": "Off under the cursor", "always": "Off"},
+                "window_margin_width": {"0": "0 (none)"},
+                "draw_minimal_borders": {"yes": "Only between windows", "no": "Around every window"},
+                "window_border_radius": {"0": "Square", "4": "4 pt", "8": "8 pt", "12": "12 pt", "16": "16 pt"},
+                "inactive_text_alpha": {"1.0": "1.0 (not faded)"},
+                "hide_window_decorations": {"no": "Show", "titlebar-only": "Hide title bar",
+                                            "yes": "Hide title bar and borders"},
+                "cursor_shape_unfocused": {"hollow": "Hollow block", "unchanged": "Same as focused"},
+                "cursor_stop_blinking_after": {"0": "Never", "5": "5 s", "15": "15 s", "30": "30 s", "60": "60 s"},
+                "tab_bar_min_tabs": {"1": "1 tab (always)", "2": "2 tabs", "3": "3 tabs"},
+                "tab_bar_margin_height": {"0.0 0.0": "None", "2.0 2.0": "2 pt both", "4.0 4.0": "4 pt both",
+                                          "6.0 6.0": "6 pt both", "0.0 4.0": "4 pt next to the text",
+                                          "4.0 0.0": "4 pt at the window edge"},
+                "scrollbar": {"scrolled": "While scrolled back", "always": "Always", "never": "Never",
+                              "hovered": "When the mouse is near", "scrolled-or-hovered": "Scrolled back or mouse near",
+                              "scrolled-and-hovered": "Scrolled back and mouse near"},
+                "scrollbar_width": {"0.25": "Quarter cell", "0.5": "Half cell", "0.75": "Three quarters",
+                                    "1.0": "One cell"},
+                "scrollbar_handle_color": {"foreground": "Text colour", "selection_background": "Selection colour"},
+                "scrollbar_track_opacity": {"0": "0 (hidden)"}}
 CHOICE_NOTES.update({key: names for _l, key, _c, _d, names in PROMPT_KEYS if names})
 CHOICE_NOTES.update({key: names for _l, key, _c, names, _n in ZSH_KEYS})
 CHOICE_NOTES["prompt_mode"] = {}
@@ -357,6 +581,15 @@ def detect_os():
     return "Linux"
 
 
+def pts(value, i=0):
+    """Number i of a kitty size like "4" or "2.0 6" in pixels (pt at 96 dpi); 0 when unreadable."""
+    try:
+        parts = value.split()
+        return float((parts[i] if i < len(parts) else parts[-1]).removesuffix("pt")) * 96 / 72
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def hex_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
@@ -373,7 +606,7 @@ SHELL_RC = {
 SHELL_RC_NAMES = {"zsh": ".zshrc", "fish": "config.fish", "bash": ".bashrc"}
 NOT_FOUND = {"zsh": "zsh: command not found: sl", "fish": "fish: Unknown command: sl",
              "bash": "bash: sl: command not found"}
-STARSHIP_BIN = shutil.which("starship")
+STARSHIP_BIN = find_extra("starship")
 # Lines Kitty Styler adds to the shell config so starship takes over the prompt. They are skipped
 # when KITTY_STYLER_BASE_PROMPT is set, which is how the preview draws the shell's own prompt.
 SWITCH_TOP_BEGIN = "# >>> KITTY STYLER PROMPT SETUP >>>"
@@ -852,7 +1085,8 @@ class Preview(Gtk.DrawingArea):
         lh = logical.height * float(s["modify_font cell_height"].rstrip("%")) / 100
         yoff = (lh - logical.height) / 2
         per_cell = cw != logical.width
-        pad = float(s["window_padding_width"]) * 96 / 72
+        # Margin and padding both show the background colour, so the preview adds them up.
+        pad = pts(s["window_padding_width"]) + pts(s["window_margin_width"])
 
         cr.save()
         cr.rectangle(*win)
@@ -860,8 +1094,10 @@ class Preview(Gtk.DrawingArea):
         style, pl = TAB_STYLES[s["tab_bar"]]
         tab_h = lh if style != "hidden" else 0
         top = s["tab_bar_edge"] == "top"
-        tab_y = win[1] if top else win[1] + win[3] - tab_h
-        text_y0 = win[1] + (tab_h if top else 0) + pad
+        # Tab bar margins: outer is between the window edge and the bar, inner between the bar and the text.
+        outer, inner = (pts(s["tab_bar_margin_height"], i) for i in (0, 1)) if tab_h else (0, 0)
+        tab_y = win[1] + outer if top else win[1] + win[3] - outer - tab_h
+        text_y0 = win[1] + (outer + tab_h + inner if top else 0) + pad
 
         x0 = win[0] + pad
         cursor_xy = None
@@ -908,16 +1144,18 @@ class Preview(Gtk.DrawingArea):
                 x += n * cw
         if tab_h:
             # After the text, so a preview taller than the window tucks under the tab bar.
-            self.draw_tabs(cr, layout, win[0], tab_y, win[2], tab_h, style, pl, cw)
+            mw = pts(s["tab_bar_margin_width"])
+            self.draw_tabs(cr, layout, win[0] + mw, tab_y, win[2] - 2 * mw, tab_h, style, pl, cw)
         if cursor_xy:
             x, y = cursor_xy
             shape = s["cursor_shape"]
             if shape == "block":
                 rect = (x, y, cw, lh)
             elif shape == "beam":
-                rect = (x, y, max(1.5, cw * 0.12), lh)
+                rect = (x, y, max(1.0, pts(s["cursor_beam_thickness"])), lh)
             else:
-                rect = (x, y + lh - 2, cw, 2)
+                th = max(1.0, pts(s["cursor_underline_thickness"]))
+                rect = (x, y + lh - th, cw, th)
             self.cursor.place(rect, c["cursor"])
         cr.restore()
 
@@ -1025,8 +1263,13 @@ class Preview(Gtk.DrawingArea):
                     cr.close_path()
                     cr.fill()
                     adv = tw + h * 0.5
-            layout.set_markup(f"<i>{GLib.markup_escape_text(label)}</i>" if not active
-                              else GLib.markup_escape_text(label), -1)
+            markup = GLib.markup_escape_text(label)
+            font_style = self.app.settings["active_tab_font_style" if active else "inactive_tab_font_style"]
+            if "bold" in font_style:
+                markup = f"<b>{markup}</b>"
+            if "italic" in font_style:
+                markup = f"<i>{markup}</i>"
+            layout.set_markup(markup, -1)
             cr.set_source_rgb(*hex_rgb(fg))
             cr.move_to(tx, y)
             PangoCairo.show_layout(cr, layout)
@@ -1155,9 +1398,19 @@ class StylerWindow(Gtk.ApplicationWindow):
                         margin_start=16, margin_end=16)
         self.dropdowns = {}
         row = 0
-        rows = [("Theme", "theme", list(self.themes)), ("Font", "font_family", self.fonts)]
-        rows += [(label, key, choices) for label, key, choices, _d in OPTIONS]
-        rows.append(("Tab bar style", "tab_bar", list(TAB_STYLES)))
+        rows = [("Theme", "theme", list(self.themes))]
+        for heading, opts in OPTION_GROUPS:
+            rows.append((heading, None, None))
+            if heading == "Text":
+                rows.append(("Font", "font_family", self.fonts))
+            for label, key, choices, _d in opts:
+                rows.append((label, key, ["auto", *self.fonts] if choices is FONT_CHOICES else choices))
+                if key == "cursor_trail" and len(TRAIL_STYLES) > 1:
+                    rows.append(("Trail style", "trail_style", list(TRAIL_STYLES)))
+                if key == "tab_bar_align":
+                    rows.append(("Tab bar style", "tab_bar", list(TAB_STYLES)))
+                if key == "hide_window_decorations" and len(EFFECTS) > 1:
+                    rows.append(("Effect", "effect", list(EFFECTS)))
         if self.prompt_choices:
             rows.append(("Prompt", None, None))
             rows.append(("Prompt", "prompt_mode", self.prompt_choices))
@@ -1173,6 +1426,10 @@ class StylerWindow(Gtk.ApplicationWindow):
                      if need is None or has[need]]
         # Everything below the prompt switch; hidden while it is off.
         self.prompt_widgets = []
+        # Rows hidden while the setting they depend on is off.
+        self.dep_widgets = {parent: [] for parent in DEPENDS}
+        # Install notes for missing extras: name -> [(box, label, button)].
+        self.extra_boxes = {}
         in_prompt = False
         for label, key, choices in rows:
             if key is None:
@@ -1241,6 +1498,9 @@ class StylerWindow(Gtk.ApplicationWindow):
                 self.prompt_note.add_css_class("dim-label")
                 grid.attach(self.prompt_note, 0, row, 2, 1)
                 row += 1
+                if not STARSHIP_BIN:
+                    grid.attach(self.extra_box("starship", "Styling the prompt needs starship."), 0, row, 2, 1)
+                    row += 1
             if key == "theme":
                 self.theme_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, selectable=True)
                 self.theme_note.add_css_class("dim-label")
@@ -1250,11 +1510,22 @@ class StylerWindow(Gtk.ApplicationWindow):
                 self.reload_btn.connect("clicked", self.on_reload_themes)
                 grid.attach(self.reload_btn, 0, row, 2, 1)
                 row += 1
-            if key == "cursor_trail":
-                note = Gtk.Label(label="Cursor trail only shows when the cursor moves; not drawn in the preview.",
-                                 xalign=0, wrap=True, max_width_chars=34)
+            parent = DEPENDENT.get(key)
+            if parent:
+                self.dep_widgets[parent] += [name_label, step if stepped else dd]
+            if key in ("trail_style", "effect") and not SLANGC:
+                box = self.extra_box("slangc", SLANG_NOTE)
+                grid.attach(box, 0, row, 2, 1)
+                if parent:
+                    self.dep_widgets[parent].append(box)
+                row += 1
+            note = ROW_NOTES.get(key)
+            if note:
+                note = Gtk.Label(label=note, xalign=0, wrap=True, max_width_chars=34)
                 note.add_css_class("dim-label")
                 grid.attach(note, 0, row, 2, 1)
+                if parent:
+                    self.dep_widgets[parent].append(note)
                 row += 1
         self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, selectable=True)
         grid.attach(self.status, 0, row, 2, 1)
@@ -1288,6 +1559,9 @@ class StylerWindow(Gtk.ApplicationWindow):
         pl = conf.get("tab_powerline_style", "angled")
         s["tab_bar"] = next((k for k, v in TAB_STYLES.items() if v == (style, pl) or (v[0] == style and v[1] is None)),
                             "fade")
+        shaders = conf.get("custom_shaders", "").split()
+        s["trail_style"] = shader_pick(shaders, TRAIL_STYLES)[1] or "plain"
+        s["effect"] = shader_pick(shaders, EFFECTS)[1] or "none"
         s["theme"] = BASE_LABEL
         if STYLER_INCLUDE in text.splitlines():
             m = re.match(r"# Theme: (.+)", read(STYLER_THEME))
@@ -1323,11 +1597,69 @@ class StylerWindow(Gtk.ApplicationWindow):
             dd.set_selected(dd.choices.index(value))
         for widget in self.prompt_widgets:
             widget.set_visible(self.settings["prompt_mode"] == "styled")
+        for parent in DEPENDS:
+            self.show_dependent(parent)
         self.syncing = False
         self.refresh()
 
     def on_step(self, _btn, dd, delta):
         dd.set_selected((dd.get_selected() + delta) % len(dd.choices))
+
+    def extra_box(self, name, text):
+        """A note saying an option needs an extra program, with a button that installs it."""
+        box = Gtk.Box(spacing=8)
+        label = Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=26, hexpand=True)
+        label.add_css_class("dim-label")
+        btn = Gtk.Button(label="Install", valign=Gtk.Align.CENTER)
+        btn.connect("clicked", self.on_install, name)
+        box.append(label)
+        box.append(btn)
+        self.extra_boxes.setdefault(name, []).append((box, label, btn))
+        return box
+
+    def on_install(self, _btn, name):
+        # One at a time: two pacman runs at once fail on pacman's lock.
+        for boxes in self.extra_boxes.values():
+            for _box, _label, btn in boxes:
+                btn.set_sensitive(False)
+        for _box, _label, btn in self.extra_boxes[name]:
+            btn.set_label("Installing…")
+        self.status.set_label(f"Installing {name}…")
+
+        def work():
+            try:
+                ok, msg = install_extra(name)
+            except Exception as e:  # noqa: BLE001 - the button must not stay stuck on "Installing…"
+                ok, msg = False, f"Could not install {name}: {e}"
+            GLib.idle_add(self.on_installed, name, ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_installed(self, name, ok, msg):
+        global SLANGC
+        self.status.set_label(msg)
+        for boxes in self.extra_boxes.values():
+            for _box, _label, btn in boxes:
+                btn.set_sensitive(True)
+        for box, label, btn in self.extra_boxes[name]:
+            if not ok:
+                btn.set_label("Install")
+            elif not find_extra(name):
+                # Installed into ~/.local/bin, which is not on PATH: the message says what to do.
+                btn.set_label("Install")
+            elif name == "slangc":
+                box.set_visible(False)
+            else:
+                # The prompt choices are worked out at start, so starship shows up after a restart.
+                label.set_label("starship is installed. Restart Kitty Styler to style the prompt; "
+                                "changes not applied yet are lost.")
+                btn.set_label("Restart")
+                btn.disconnect_by_func(self.on_install)
+                btn.connect("clicked", lambda _b: os.execv(sys.executable, [sys.executable,
+                                                                           os.path.abspath(sys.argv[0])]))
+        if name == "slangc":
+            SLANGC = find_extra("slangc")
+        return False
 
     def on_changed(self, dd, _pspec, key):
         if self.syncing:
@@ -1338,6 +1670,13 @@ class StylerWindow(Gtk.ApplicationWindow):
                 widget.set_visible(self.settings[key] == "styled")
             self.ensure_render()
         self.refresh()
+        if key in DEPENDS:
+            self.show_dependent(key)
+
+    def show_dependent(self, parent):
+        on = not same(self.settings[parent], DEPENDS[parent][0])
+        for widget in self.dep_widgets[parent]:
+            widget.set_visible(on)
 
     def ensure_render(self):
         """Start drawing the real prompt for the picked mode in the background, once."""
@@ -1437,8 +1776,6 @@ class StylerWindow(Gtk.ApplicationWindow):
             out = f"Kitty starts {KITTY_SHELL}, and its prompt is {name}. Apply leaves it as it is."
             if strip_switch(read(SHELL_RC[KITTY_SHELL]).splitlines())[1]:
                 out += f" Apply removes Kitty Styler's starship lines from {rc}."
-            if not STARSHIP_BIN:
-                out += " Install starship to restyle the prompt here."
         else:
             out = ("Your starship.toml as it is." if mode == "starship" else
                    "Apply writes a prompt block into starship.toml (backed up first).")
@@ -1651,9 +1988,27 @@ def apply_all(s, themes, colors, file_conf):
     for _label, key, _choices, default in OPTIONS:
         wanted[key] = s[key]
         defaults[key] = default
-    # Only write keys already in kitty.conf, or ones that differ from kitty's default.
+    # Swap only the effect and trail names the app loaded (the first of each), in place; any other
+    # custom_shaders names, a second effect included, stay as they are.
+    shaders = file_conf.get("custom_shaders", "").split()
+    picked = []
+    for table, key in ((EFFECTS, "effect"), (TRAIL_STYLES, "trail_style")):
+        new = table.get(s[key])
+        i = shader_pick(shaders, table)[0]
+        if i is None:
+            shaders += [new] if new else []
+        elif new:
+            shaders[i] = new
+        else:
+            del shaders[i]
+        picked.append(new)
+    wanted["custom_shaders"] = " ".join(shaders)
+    defaults["custom_shaders"] = ""
+    # Only write keys already in kitty.conf itself, or ones changed from what kitty uses now. A key that
+    # only an included theme sets (Noctalia's cursor_trail_color) stays the theme's, so it keeps following it.
+    own = parse_conf(read(CONF))
     wanted = {k: v for k, v in wanted.items()
-              if k in file_conf or not same(v, defaults[k])}
+              if k in own or not same(v, file_conf.get(k, defaults[k]))}
 
     os.makedirs(KITTY_DIR, exist_ok=True)
     text = read(CONF)
@@ -1675,13 +2030,16 @@ def apply_all(s, themes, colors, file_conf):
         m = re.match(r"^(\s*)(modify_font\s+\w+|\w+)(\s+)", line)
         key = m and re.sub(r"\s+", " ", m.group(2))
         if key in wanted:
-            line = f"{m.group(1)}{key}{m.group(3)}{wanted[key]}"
             done.add(key)
+            if not wanted[key]:
+                # kitty rejects a key with no value (an emptied custom_shaders list); drop the line.
+                continue
+            line = f"{m.group(1)}{key}{m.group(3)}{wanted[key]}"
         out.append(line)
     while out and not out[-1].strip():
         out.pop()
 
-    extra = [f"{k} {v}" for k, v in wanted.items() if k not in done]
+    extra = [f"{k} {v}" for k, v in wanted.items() if k not in done and v]
     if s["theme"] != BASE_LABEL:
         os.makedirs(os.path.dirname(STYLER_THEME), exist_ok=True)
         with open(STYLER_THEME, "w", encoding="utf-8") as f:
@@ -1696,6 +2054,8 @@ def apply_all(s, themes, colors, file_conf):
     msg = ["Applied and reloaded open kitty windows."]
     if backup:
         msg.append(f"Backup: {backup}")
+    if any(picked) and not SLANGC:
+        msg.append(SLANG_NOTE + " Until it is installed they do nothing.")
     mode = s.get("prompt_mode")
     if STARSHIP_AVAILABLE and mode:
         msg.append(apply_prompt(s if mode == "styled" else None))
@@ -2233,4 +2593,16 @@ class StylerApp(Gtk.Application):
 
 
 if __name__ == "__main__":
+    # Used by install.sh: list the missing extras, or install them from a terminal (sudo, not pkexec).
+    if sys.argv[1:2] == ["--missing-extras"]:
+        for name in EXTRAS:
+            # slangc only matters when this kitty has shaders to offer.
+            if not find_extra(name) and (name != "slangc" or len(TRAIL_STYLES) > 1 or len(EFFECTS) > 1):
+                print(f"{name}\t{EXTRAS[name]['what']}")
+        sys.exit(0)
+    if sys.argv[1:2] == ["--install-extras"]:
+        results = [install_extra(name, gui=False) for name in sys.argv[2:] or
+                   [n for n in EXTRAS if not find_extra(n)]]
+        print("\n".join(msg for _ok, msg in results))
+        sys.exit(0 if all(ok for ok, _msg in results) else 1)
     sys.exit(StylerApp().run(sys.argv))

@@ -1,7 +1,7 @@
 # Kitty Styler
 
-A small GTK4 app for picking how the [kitty](https://sw.kovidgoyal.net/kitty/) terminal looks: theme, font,
-opacity, padding, cursor, line height, tab bar, your prompt (your own, or a [starship](https://starship.rs/)
+A small GTK4 app for picking how the [kitty](https://sw.kovidgoyal.net/kitty/) terminal looks: theme, fonts,
+window, cursor (including trail styles), tab bar, scrollbar, effects, your prompt (your own, or a [starship](https://starship.rs/)
 prompt styled here) and, with zsh, the shell itself (oh-my-zsh plugins, typing colours, behaviour).
 Every change shows up in a live preview before anything is written.
 
@@ -10,8 +10,18 @@ Every change shows up in a live preview before anything is written.
 ## Features
 
 - **Themes**: all of kitty's own theme collection, with a search box and previous/next buttons.
-- **Kitty settings**: font, size, background opacity, window padding, cursor shape, blink and trail, line
-  height, letter spacing, and tab bar position, alignment and style.
+- **Kitty settings**, grouped under headings:
+  - **Text**: font and size, bold and italic fonts, ligatures, line height, letter spacing.
+  - **Window**: background opacity, padding, margin, borders and their corners, faded text in inactive
+    windows, title bar, and kitty's built-in effects (dim inactive windows, focus highlight, tab change,
+    CRT, matrix and more).
+  - **Cursor**: shape (also when unfocused), beam and underline thickness, blink, and the cursor trail with
+    its style (plain, blaze, lightning, motion blur), speed, start distance and colour.
+  - **Tab bar**: position, alignment, style, when it shows, margins and the active/inactive tab text style.
+  - **Scrollbar**: when it shows, width, handle opacity, corners and colour, track opacity.
+- **Installs what options need**: trail styles and effects need kitty's shader compiler (`slangc`), and
+  prompt styling needs starship. If one is missing, the option's note gets an **Install** button (see
+  [Extras](#extras)).
 - **Live preview**: a mock terminal with a prompt, `ls`, a diff, an error, all 16 colours and the tab bar,
   drawn on your wallpaper when it can find one, so opacity is visible. The prompt is your real one: the
   app asks your shell (or starship) to draw it in the background, so Powerlevel10k, oh-my-zsh themes,
@@ -40,6 +50,10 @@ Every change shows up in a live preview before anything is written.
   your own settings outside it. Open kitty windows reload straight away.
 - **Theme**: a picked theme is saved to `themes/kitty-styler.conf` next to kitty.conf and included from the
   block. Pick "Keep current theme" to drop it and go back to your own colours.
+- **Effects and trail styles** are names in kitty's `custom_shaders` setting. Apply swaps only the
+  effect and trail style picked in the app and keeps any other names in the list.
+- Settings that only your theme sets (for example Noctalia's `cursor_trail_color`) are not copied into
+  kitty.conf unless you change them, so they keep following the theme.
 - **Backups**: before each Apply, kitty.conf is copied to `kitty.conf.bak-<date>-<time>`. The newest 5 are
   kept.
 - **starship.toml**: untouched unless you pick "Starship, styled here". Then Apply writes a block between
@@ -73,10 +87,27 @@ Symlinked config files (from a dotfile manager) are written through the link.
 - zsh, fish or bash
 - Optional: zsh with oh-my-zsh, zsh-syntax-highlighting and zsh-autosuggestions
 - Optional: starship, and a [Nerd Font](https://www.nerdfonts.com/) for the prompt icons
+- Optional: kitty 0.49 or newer with `slangc` for cursor trail styles and effects. kitty's own binary
+  bundle includes `slangc`; distro packages need it installed (Arch: `shader-slang`)
 
 The themes come from kitty's own theme collection. If the list is empty, run `kitty +kitten themes` once and
 press Esc to quit it: kitty downloads the collection into `~/.cache/kitty/kitty-themes.zip`. Then press
 "Reload themes".
+
+## Extras
+
+Two programs are optional and only needed for some options:
+
+| Program | Needed for | Package (Arch) | Download | License |
+| --- | --- | --- | --- | --- |
+| `slangc` | cursor trail styles and effects | `shader-slang` | [shader-slang/slang](https://github.com/shader-slang/slang/releases) | Apache-2.0 WITH LLVM-exception |
+| `starship` | prompt styling | `starship` | [starship/starship](https://github.com/starship/starship/releases) | ISC |
+
+`install.sh` lists the missing ones and asks once whether to install them; in the app, the Install
+button next to an option's note does the same. On Arch-based systems they come from pacman, after a
+password prompt. Elsewhere (or when no password prompt can be shown), the latest release is downloaded
+from the project's GitHub page into `~/.local/share/kitty-styler/extras` and linked into `~/.local/bin`;
+no password needed, but `~/.local/bin` must be on your `PATH`. Nothing is bundled with Kitty Styler.
 
 ## Install
 
@@ -85,7 +116,8 @@ curl -fsSL https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/instal
 ```
 
 This copies the app to `~/.local/share/kitty-styler`, adds **Kitty Styler** to your app menu and a
-`kitty-styler` command to `~/.local/bin`. Run the same command again to update. Or clone the repository
+`kitty-styler` command to `~/.local/bin`, then offers to install the [extras](#extras) that are missing.
+Run the same command again to update. Or clone the repository
 and run the script from it:
 
 ```sh
@@ -123,11 +155,12 @@ reads its real config; it never writes to it.
 
 ## Tested on
 
-CachyOS with Hyprland, kitty, starship 1.26, Noctalia and zsh 5.9 with CachyOS's oh-my-zsh setup, plus test setups without Noctalia and without a
+CachyOS with Hyprland, kitty 0.49, starship 1.26, Noctalia and zsh 5.9 with CachyOS's oh-my-zsh setup, plus test setups without Noctalia and without a
 kitty config. Prompt preview and switching tested with Powerlevel10k (one- and two-line presets),
 CachyOS's fish 4.9 prompt and bash. fish's Tide prompt is not tested.
 
 ## License
 
 [CC0 1.0](LICENSE): no rights reserved. Themes are not included; they are read from kitty's own download at
-runtime. oh-my-zsh plugin descriptions and aliases are read from your own oh-my-zsh install, never bundled.
+runtime. The [extras](#extras) are installed from their own packages or releases, never bundled.
+oh-my-zsh plugin descriptions and aliases are read from your own oh-my-zsh install, never bundled.

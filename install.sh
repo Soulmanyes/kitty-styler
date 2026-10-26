@@ -66,5 +66,25 @@ Categories=Settings;Utility;
 StartupWMClass=$APP_ID
 DESKTOP
 
+# Optional extras some options need (shader compiler, starship). Ask once; the app also has
+# Install buttons for anything skipped here.
+missing=$(python3 "$DEST/kitty-styler.py" --missing-extras 2>/dev/null || true)
+if [ -n "$missing" ]; then
+    say "Optional extras that some options need:"
+    printf '%s\n' "$missing" | while IFS="	" read -r extra what; do
+        printf '  %s: %s\n' "$extra" "$what"
+    done
+    printf 'Install them now? Arch-based systems use pacman (asks for your password); others get a download in ~/.local/bin. [Y/n] '
+    # read from the terminal, so this also works when the script comes through curl | sh
+    answer=n
+    { read -r answer </dev/tty; } 2>/dev/null || { answer=n; echo; }
+    case $answer in
+        [nN]*) say "Skipped. The app shows an Install button where an option needs one." ;;
+        *) python3 "$DEST/kitty-styler.py" --install-extras \
+               $(printf '%s\n' "$missing" | cut -f1) \
+               || say "Some extras did not install; the app's Install buttons can try again." ;;
+    esac
+fi
+
 say "Done. Open \"Kitty Styler\" from your app menu, or run: $NAME"
 }
