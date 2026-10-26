@@ -1049,6 +1049,7 @@ class KittyTerminal:
 
     name = "kitty"
     label = "kitty"
+    live_reload = True
     conf = CONF
     noctalia = NOCTALIA
     # Splits, tabs, trails and shaders: the preview draws them, Try in kitty can open it.
@@ -1306,6 +1307,7 @@ class AlacrittyTerminal:
 
     name = "alacritty"
     label = "Alacritty"
+    live_reload = True
     kitty_only = False
     neutral = NO_KITTY_EXTRAS
 
@@ -1613,10 +1615,297 @@ class AlacrittyTerminal:
         pass
 
 
+FOOT_OPTIONS = {
+    "font_size": (None, "8.0"), "bold_font": (None, "auto"), "italic_font": (None, "auto"),
+    "bold_italic_font": (None, "auto"), "background_opacity": (None, "1.00"),
+    "window_padding_width": (None, "0"), "hide_window_decorations": (["no", "yes"], "no"),
+    "cursor_shape": (None, "block"), "cursor_shape_unfocused": (["hollow", "unchanged"], "hollow"),
+    "cursor_beam_thickness": (None, "1.5"), "cursor_underline_thickness": (None, "2.0"),
+    "cursor_blink_interval": (["0", "0.3", "0.5", "0.8", "1.2"], "0"),
+}
+FOOT_FONTS = {"font_family": "font", "bold_font": "font-bold", "italic_font": "font-italic",
+              "bold_italic_font": "font-bold-italic"}
+FOOT_COLORS = {"foreground": "foreground", "background": "background",
+               "selection_foreground": "selection-foreground", "selection_background": "selection-background",
+               **{f"color{i}": f"{'regular' if i < 8 else 'bright'}{i % 8}" for i in range(16)}}
+
+
+def ini_line(line):
+    """("section", None) for a [section] line, (None, (key, value)) for key=value, else (None, None)."""
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None, None
+    m = re.fullmatch(r"\[([^\]]+)\]", text)
+    if m:
+        return m.group(1).strip(), None
+    key, eq, value = text.partition("=")
+    return None, ((key.strip(), value.strip()) if eq else None)
+
+
+class FootTerminal:
+    """foot. Keys foot.ini sets itself are edited in place; the rest go in a block at the end, with
+    the theme as an include there (later lines win). The theme file is not under themes/: Noctalia's
+    foot hook deletes every include of a themes/ file when it adds its own. foot reads its config
+    when a window opens, so open windows keep theirs."""
+
+    name = "foot"
+    label = "foot"
+    live_reload = False
+    kitty_only = False
+    neutral = NO_KITTY_EXTRAS
+    THEME_FILE = "kitty-styler.ini"
+    BEGIN = "# BEGIN_KITTY_STYLER (managed by kitty-styler; keep this block last so it wins)"
+    END = "# END_KITTY_STYLER"
+
+    def __init__(self, conf=None):
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        self.conf = conf or os.environ.get("KITTY_STYLER_FOOT") or os.path.join(xdg, "foot", "foot.ini")
+        self.dir = os.path.dirname(self.conf)
+        self.theme_file = os.path.join(self.dir, self.THEME_FILE)
+        self.noctalia_theme = os.path.join(self.dir, "themes", "noctalia")
+        self.notes = []
+
+    def supports(self, key):
+        return key in FOOT_OPTIONS or key in FOOT_FONTS or key not in TERMINAL_KEYS
+
+    def choices(self, key, choices):
+        return FOOT_OPTIONS.get(key, (None,))[0] or choices
+
+    def theme_note(self):
+        return (f"Apply saves this theme as {self.THEME_FILE} and includes it at the end of foot.ini. "
+                f'Pick "{BASE_LABEL}" to go back to your own colours.')
+
+    def include_path(self, path):
+        home = os.path.expanduser("~") + os.sep
+        return "~/" + path[len(home):] if path.startswith(home) else path
+
+    def parse(self, path, skip=(), seen=None):
+        """{(section, key): value} as foot reads it: later lines win, includes read in place."""
+        seen = set() if seen is None else seen
+        real = os.path.realpath(path)
+        if real in seen or real in skip:
+            return {}
+        seen.add(real)
+        out, section = {}, "main"
+        for line in read(path).splitlines():
+            sec, kv = ini_line(line)
+            if sec:
+                section = "colors-dark" if sec == "colors" else sec
+            elif kv and kv[0] == "include":
+                out.update(self.parse(os.path.expanduser(kv[1]), skip, seen))
+            elif kv:
+                out[(section, kv[0])] = kv[1]
+        return out
+
+    @property
+    def noctalia(self):
+        own = self.parse(self.conf, skip={os.path.realpath(self.noctalia_theme),
+                                          os.path.realpath(self.theme_file)})
+        on = any(kv and kv[0] == "include" and "noctalia" in kv[1]
+                 for _sec, kv in map(ini_line, read(self.conf).splitlines()))
+        return bool(on and os.path.exists(self.noctalia_theme) and '"foot"' in read(NOCTALIA_SETTINGS)
+                    and not any(sec == "colors-dark" and key in FOOT_COLORS.values() for sec, key in own))
+
+    @staticmethod
+    def font_parts(value):
+        """("Family", size or None, the rest of the value) of a foot font list."""
+        first, sep, rest = (value or "").partition(",")
+        family, *opts = first.split(":")
+        size = next((o.split("=", 1)[1] for o in opts if o.startswith("size=")), None)
+        return family.strip(), size, opts, sep + rest
+
+    def to_kitty(self, data):
+        out = {key: default for key, (_choices, default) in FOOT_OPTIONS.items()}
+        family, size, _opts, _rest = self.font_parts(data.get(("main", "font"), "monospace:size=8"))
+        out["font_family"] = family or "monospace"
+        if size:
+            try:
+                out["font_size"] = f"{float(size):.1f}" if round(float(size), 1) == float(size) else size
+            except ValueError:
+                pass
+        for key, name in FOOT_FONTS.items():
+            if key != "font_family":
+                other = self.font_parts(data.get(("main", name)))[0]
+                out[key] = other if other and other != out["font_family"] else "auto"
+        if ("colors-dark", "alpha") in data:
+            try:
+                out["background_opacity"] = f"{float(data[('colors-dark', 'alpha')]):.2f}"
+            except ValueError:
+                pass
+        m = re.match(r"(\d+)x\d+", data.get(("main", "pad"), ""))
+        if m:
+            out["window_padding_width"] = m.group(1)
+        out["hide_window_decorations"] = "yes" if data.get(("csd", "preferred")) == "none" else "no"
+        style = data.get(("cursor", "style"), "block")
+        out["cursor_shape"] = style if style in ("block", "beam", "underline") else "block"
+        unfocused = data.get(("cursor", "unfocused-style"), "hollow")
+        out["cursor_shape_unfocused"] = unfocused if unfocused in ("hollow", "unchanged") else "hollow"
+        for key, name in (("cursor_beam_thickness", "beam-thickness"),
+                          ("cursor_underline_thickness", "underline-thickness")):
+            if ("cursor", name) in data and not data[("cursor", name)].endswith("px"):
+                out[key] = data[("cursor", name)]
+        if data.get(("cursor", "blink")) in ("yes", "true", "1"):
+            out["cursor_blink_interval"] = seconds(int(data.get(("cursor", "blink-rate"), "500")) / 1000)
+        if ("main", "shell") in data:
+            out["shell"] = data[("main", "shell")]
+        for key, name in FOOT_COLORS.items():
+            color = hex_color("#" + data.get(("colors-dark", name), ""))
+            if color:
+                out[key] = color
+        cursor = data.get(("colors-dark", "cursor"), "").split()
+        if len(cursor) == 2 and all(hex_color("#" + c) for c in cursor):
+            out["cursor_text_color"], out["cursor"] = (hex_color("#" + c) for c in cursor)
+        return out
+
+    def to_foot(self, s, data):
+        """{kitty key: {(section, key): value}}; data is what foot uses now, so font options stay."""
+        out = {}
+        _family, _size, opts, rest = self.font_parts(data.get(("main", "font"), "monospace:size=8"))
+        opts = [o for o in opts if not o.startswith("size=")]
+        main_font = ":".join([s["font_family"], *opts, f"size={s['font_size']}"]) + rest
+        out["font_family"] = out["font_size"] = {("main", "font"): main_font}
+        for key, name in FOOT_FONTS.items():
+            if key != "font_family":
+                out[key] = {("main", name): s["font_family"] if s[key] == "auto" else s[key]}
+        out["background_opacity"] = {("colors-dark", "alpha"): s["background_opacity"]}
+        pad = int(float(s["window_padding_width"]))
+        out["window_padding_width"] = {("main", "pad"): f"{pad}x{pad}"}
+        out["hide_window_decorations"] = {("csd", "preferred"): "none" if s["hide_window_decorations"] == "yes"
+                                          else "server"}
+        out["cursor_shape"] = {("cursor", "style"): s["cursor_shape"]}
+        out["cursor_shape_unfocused"] = {("cursor", "unfocused-style"): s["cursor_shape_unfocused"]}
+        out["cursor_beam_thickness"] = {("cursor", "beam-thickness"): s["cursor_beam_thickness"]}
+        out["cursor_underline_thickness"] = {("cursor", "underline-thickness"): s["cursor_underline_thickness"]}
+        blink = float(s["cursor_blink_interval"])
+        out["cursor_blink_interval"] = {("cursor", "blink"): "yes" if blink > 0 else "no"}
+        if blink > 0:
+            out["cursor_blink_interval"][("cursor", "blink-rate")] = str(round(blink * 1000))
+        return out
+
+    def read_conf(self, without_theme=False):
+        return self.to_kitty(self.parse(self.conf, skip={os.path.realpath(self.theme_file)} if without_theme else ()))
+
+    def theme(self):
+        text = read(self.theme_file)
+        if not (text.startswith("# Theme: ") and self.include_path(self.theme_file) in read(self.conf)):
+            return None, ""
+        colors = self.to_kitty(self.parse(self.theme_file))
+        return text.split("\n", 1)[0][len("# Theme: "):].strip(), "".join(
+            f"{k} {colors[k]}\n" for k in (*FOOT_COLORS, "cursor", "cursor_text_color") if k in colors)
+
+    def noctalia_colors(self):
+        colors = self.to_kitty(self.parse(self.noctalia_theme))
+        return {k: v for k, v in colors.items() if k in FOOT_COLORS or k in ("cursor", "cursor_text_color")}
+
+    def shell(self):
+        return kitty_shell(self.read_conf())
+
+    def write(self, s, themes, file_conf):
+        text = read(self.conf)
+        lines, block, in_block = [], {}, False
+        for line in text.splitlines():
+            if line.strip().startswith("# BEGIN_KITTY_STYLER"):
+                in_block, section = True, "main"
+                continue
+            if in_block:
+                if line.strip() == self.END:
+                    in_block = False
+                    continue
+                sec, kv = ini_line(line)
+                if sec:
+                    section = sec
+                elif kv and kv[0] != "include":
+                    block[(section, kv[0])] = kv[1]
+                continue
+            lines.append(line)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        now = self.parse(self.conf)
+        changed = {key for key in FOOT_FONTS | FOOT_OPTIONS if not same(str(s[key]), str(file_conf.get(key, "")))}
+        if "font_family" in changed:
+            changed |= {key for key in FOOT_FONTS if s[key] == "auto"}
+        wanted = {}
+        for key, paths in self.to_foot(s, now).items():
+            if key in changed:
+                wanted.update(paths)
+        # Lines the file sets itself are changed where they are (the last one, which wins).
+        section, last = "main", {}
+        for i, line in enumerate(lines):
+            sec, kv = ini_line(line)
+            if sec:
+                section = "colors-dark" if sec == "colors" else sec
+            elif kv:
+                last[(section, kv[0])] = i
+        for path, value in wanted.items():
+            if path in last and path not in block:
+                i = last[path]
+                indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                lines[i] = f"{indent}{path[1]}={value}"
+            else:
+                block[path] = value
+        out = list(lines)
+        theme = s["theme"] if s["theme"] != BASE_LABEL else None
+        if block or theme:
+            out += ([""] if out else []) + [self.BEGIN]
+            sections = {}
+            for (sec, key), value in block.items():
+                sections.setdefault(sec, []).append(f"{key}={value}")
+            if theme:
+                sections.setdefault("main", []).insert(0, f"include={self.include_path(self.theme_file)}")
+            for sec, entries in sections.items():
+                out += [f"[{sec}]", *entries]
+            out.append(self.END)
+        new_text = "\n".join(out) + "\n" if out else ""
+        theme_text = None
+        if theme:
+            colors = parse_conf(themes[theme])
+            entries = [f"{name}={hex_color(colors[k])[1:]}" for k, name in FOOT_COLORS.items()
+                       if hex_color(colors.get(k, ""))]
+            if hex_color(colors.get("cursor", "")):
+                text_color = hex_color(colors.get("cursor_text_color", "")) or hex_color(colors.get("background", ""))
+                if text_color:
+                    entries.append(f"cursor={text_color[1:]} {hex_color(colors['cursor'])[1:]}")
+            theme_text = "\n".join([f"# Theme: {theme}", "# Written by kitty-styler from kitty's theme collection.",
+                                    "[colors-dark]", *entries]) + "\n"
+        if shutil.which("foot"):
+            # foot checks the whole config, includes too; nothing is written if it says no.
+            with tempfile.TemporaryDirectory() as tmp:
+                conf = os.path.join(tmp, "foot.ini")
+                check_text = new_text
+                if theme_text:
+                    with open(os.path.join(tmp, self.THEME_FILE), "w", encoding="utf-8") as f:
+                        f.write(theme_text)
+                    check_text = new_text.replace(f"include={self.include_path(self.theme_file)}",
+                                                  f"include={os.path.join(tmp, self.THEME_FILE)}")
+                with open(conf, "w", encoding="utf-8") as f:
+                    f.write(check_text)
+                r = subprocess.run(["foot", "--check-config", "-c", conf], capture_output=True, text=True,
+                                   timeout=10, check=False)
+                if r.returncode != 0:
+                    err = (r.stderr or r.stdout).strip().splitlines()
+                    raise OSError(f"left {self.conf} alone: foot rejects the result ({err[-1] if err else '?'})")
+        backup = None
+        if text and new_text != text:
+            backup = f"{self.conf}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(self.conf, backup)
+            prune_backups(self.conf)
+        if theme_text:
+            write_atomic(self.theme_file, theme_text)
+        if new_text != text:
+            write_atomic(self.conf, new_text)
+        if not theme and os.path.exists(self.theme_file):
+            os.remove(self.theme_file)
+        self.notes = ["foot reads its config when a window opens: new foot windows get this, open ones keep theirs."]
+        return backup
+
+    def reload(self):
+        pass
+
+
 # Settings that belong to the terminal (the rest are the prompt's and the shell's).
 TERMINAL_KEYS = {key for _l, key, _c, _d in OPTIONS} | {"font_family", "tab_bar", "trail_style", "effect"}
-TERMINALS = {"kitty": KittyTerminal, "alacritty": AlacrittyTerminal}
-TERMINAL_BINARIES = {"kitty": "kitty", "alacritty": "alacritty"}
+TERMINALS = {"kitty": KittyTerminal, "alacritty": AlacrittyTerminal, "foot": FootTerminal}
+TERMINAL_BINARIES = {"kitty": "kitty", "alacritty": "alacritty", "foot": "foot"}
 TERMINAL_STATE = os.path.join(os.path.dirname(UPDATE_STATE), "terminal")
 ZSH_INSTALLED = ZSH_AVAILABLE
 
@@ -1631,8 +1920,9 @@ def available_terminals():
 def default_terminal():
     """KITTY_STYLER_TERMINAL, else the one picked last time, else the one the app was started from."""
     have = available_terminals()
+    term = os.environ.get("TERM", "")
     launched = "alacritty" if os.environ.get("ALACRITTY_WINDOW_ID") else \
-               "kitty" if os.environ.get("KITTY_WINDOW_ID") else None
+               "kitty" if os.environ.get("KITTY_WINDOW_ID") else "foot" if term.startswith("foot") else None
     for name in (os.environ.get("KITTY_STYLER_TERMINAL"), read(TERMINAL_STATE).strip(), launched):
         if name in have:
             return name
@@ -3852,7 +4142,8 @@ def apply_all(s, themes, colors, file_conf, reload=True):
     picked = [EFFECTS.get(s["effect"]), TRAIL_STYLES.get(s["trail_style"])]
     if reload:
         TERMINAL.reload()
-    msg = [f"Applied and reloaded open {TERMINAL.label} windows.", *getattr(TERMINAL, "notes", [])]
+    msg = [f"Applied and reloaded open {TERMINAL.label} windows." if TERMINAL.live_reload
+           else f"Applied to {TERMINAL.label}.", *getattr(TERMINAL, "notes", [])]
     if backup:
         msg.append(f"Backup: {backup}")
     if any(picked) and not SLANGC:
