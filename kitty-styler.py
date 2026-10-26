@@ -1048,7 +1048,22 @@ class KittyTerminal:
     maps them to its own config."""
 
     name = "kitty"
+    label = "kitty"
+    conf = CONF
     noctalia = NOCTALIA
+    # Splits, tabs, trails and shaders: the preview draws them, Try in kitty can open it.
+    kitty_only = True
+    neutral = None
+
+    def supports(self, _key):
+        return True
+
+    def choices(self, _key, choices):
+        return choices
+
+    def theme_note(self):
+        return ("Apply saves this theme as themes/kitty-styler.conf and includes it at the end of kitty.conf. "
+                f'Pick "{BASE_LABEL}" to go back to your own colours.')
 
     def read_conf(self, without_theme=False):
         """What the terminal uses now, includes followed; without_theme leaves out our theme file."""
@@ -1274,6 +1289,11 @@ ALACRITTY_OPTIONS = {
     "cursor_blink_interval": (["0", "0.3", "0.5", "0.75", "1.2"], "0"),
     "cursor_stop_blinking_after": (["0", "5", "15", "30", "60"], "5"),
 }
+# Values that turn off what other terminals don't have, so the preview doesn't draw it.
+NO_KITTY_EXTRAS = {"tab_bar": "hidden", "trail_style": "plain", "effect": "none", "cursor_trail": "0",
+                   "scrollbar": OFF_SCROLLBAR, "window_margin_width": "0", "draw_minimal_borders": "yes",
+                   "window_border_radius": "0", "inactive_text_alpha": "1.0", "disable_ligatures": "always",
+                   "modify_font cell_height": "100%", "modify_font cell_width": "100%"}
 ALACRITTY_FONTS = {"font_family": "normal", "bold_font": "bold", "italic_font": "italic",
                    "bold_italic_font": "bold_italic"}
 
@@ -1285,6 +1305,20 @@ class AlacrittyTerminal:
     imported before ours, so they don't win over it. Picking the base theme puts them back."""
 
     name = "alacritty"
+    label = "Alacritty"
+    kitty_only = False
+    neutral = NO_KITTY_EXTRAS
+
+    def supports(self, key):
+        return key in ALACRITTY_OPTIONS or key in ALACRITTY_FONTS or key not in TERMINAL_KEYS
+
+    def choices(self, key, choices):
+        return ALACRITTY_OPTIONS.get(key, (None,))[0] or choices
+
+    def theme_note(self):
+        return (f"Apply saves this theme in {self.MANAGED}, which alacritty.toml imports. While a theme is "
+                f"picked, the [colors] tables of alacritty.toml wait in {self.SIDE}; picking "
+                f'"{BASE_LABEL}" puts them back.')
     MANAGED = "kitty-styler.toml"
     SIDE = "alacritty-colors.kitty-styler.toml"
     NOCTALIA_IMPORT = "noctalia.toml"
@@ -1338,8 +1372,8 @@ class AlacrittyTerminal:
     def noctalia(self):
         imports = self.imports(toml_file(self.conf))
         on = any(entry.endswith(self.NOCTALIA_IMPORT) for entry in imports) and os.path.exists(self.noctalia_theme)
-        # The main file's own colours win over Noctalia's, unless they are parked in the side file.
-        own = deep_get(toml_file(self.conf), ("colors",)) and not os.path.exists(self.side)
+        # The main file's own colours win over Noctalia's (also while they wait in the side file).
+        own = deep_get(toml_file(self.conf), ("colors",)) or os.path.exists(self.side)
         return bool(on and not own and '"alacritty"' in read(NOCTALIA_SETTINGS))
 
     def to_kitty(self, data):
@@ -1579,10 +1613,45 @@ class AlacrittyTerminal:
         pass
 
 
-TERMINAL = KittyTerminal()
-KITTY_SHELL = TERMINAL.shell()
-# The Shell (zsh) section edits .zshrc, which only matters when kitty runs zsh.
-ZSH_AVAILABLE = ZSH_AVAILABLE and KITTY_SHELL == "zsh"
+# Settings that belong to the terminal (the rest are the prompt's and the shell's).
+TERMINAL_KEYS = {key for _l, key, _c, _d in OPTIONS} | {"font_family", "tab_bar", "trail_style", "effect"}
+TERMINALS = {"kitty": KittyTerminal, "alacritty": AlacrittyTerminal}
+TERMINAL_BINARIES = {"kitty": "kitty", "alacritty": "alacritty"}
+TERMINAL_STATE = os.path.join(os.path.dirname(UPDATE_STATE), "terminal")
+ZSH_INSTALLED = ZSH_AVAILABLE
+
+
+def available_terminals():
+    """The terminals installed here, or with a config file; kitty first."""
+    out = [name for name, cls in TERMINALS.items()
+           if shutil.which(TERMINAL_BINARIES[name]) or os.path.exists(cls().conf)]
+    return out or ["kitty"]
+
+
+def default_terminal():
+    """KITTY_STYLER_TERMINAL, else the one picked last time, else the one the app was started from."""
+    have = available_terminals()
+    launched = "alacritty" if os.environ.get("ALACRITTY_WINDOW_ID") else \
+               "kitty" if os.environ.get("KITTY_WINDOW_ID") else None
+    for name in (os.environ.get("KITTY_STYLER_TERMINAL"), read(TERMINAL_STATE).strip(), launched):
+        if name in have:
+            return name
+    return have[0]
+
+
+def set_terminal(name, remember=False):
+    """Point the app at another terminal; the globals below follow it."""
+    global TERMINAL, BASE_LABEL, KITTY_SHELL, ZSH_AVAILABLE
+    TERMINAL = TERMINALS[name]()
+    BASE_LABEL = "Noctalia (follows wallpaper)" if TERMINAL.noctalia else "Keep current theme"
+    KITTY_SHELL = TERMINAL.shell()
+    # The Shell (zsh) section edits .zshrc, which only matters when the terminal runs zsh.
+    ZSH_AVAILABLE = ZSH_INSTALLED and KITTY_SHELL == "zsh"
+    if remember:
+        write_atomic(TERMINAL_STATE, name + "\n")
+
+
+set_terminal(default_terminal())
 
 
 class Cursor(Gtk.DrawingArea):
@@ -1933,8 +2002,12 @@ class Preview(Gtk.Widget):
         frame = (pts(s["window_margin_width"]) + self.border_width() + pts(s["window_padding_width"]))
         # The main window keeps at least 60% of the height.
         split = max(y0 + (y1 - y0) * 0.6, y1 - 2 * frame - len(other) * self.lh)
+        if not TERMINAL.kitty_only:
+            split = y1  # no splits: one window
         spots, box = self.draw_window(cr, layout, (win[0], y0, win[2], split - y0), True, main)
-        unfocused, _box = self.draw_window(cr, layout, (win[0], split, win[2], y1 - split), False, other)
+        unfocused = {}
+        if split < y1:
+            unfocused, _box = self.draw_window(cr, layout, (win[0], split, win[2], y1 - split), False, other)
         self.draw_scrollbar(cr, box)
         if tab_h:
             # After the text, so a preview taller than the window tucks under the tab bar.
@@ -2514,7 +2587,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         header = Gtk.HeaderBar()
-        apply_btn = Gtk.Button(label="Apply to kitty")
+        apply_btn = Gtk.Button(label=f"Apply to {TERMINAL.label}")
         apply_btn.add_css_class("suggested-action")
         apply_btn.connect("clicked", self.on_apply)
         reset_btn = Gtk.Button(label="Reset to current")
@@ -2525,7 +2598,8 @@ class StylerWindow(Gtk.ApplicationWindow):
                              tooltip_text="Open a kitty window with these settings, without saving them")
         try_btn.connect("clicked", self.on_try)
         header.pack_end(apply_btn)
-        header.pack_end(try_btn)
+        if TERMINAL.kitty_only:
+            header.pack_end(try_btn)
         header.pack_start(reset_btn)
         header.pack_start(share_btn)
         self.set_titlebar(header)
@@ -2536,19 +2610,33 @@ class StylerWindow(Gtk.ApplicationWindow):
         # Row names, for what a share code couldn't load.
         self.row_labels = {}
         row = 0
+        terminals = available_terminals()
+        if len(terminals) > 1:
+            label = Gtk.Label(label="Terminal", xalign=0)
+            label.add_css_class("heading")
+            grid.attach(label, 0, row, 1, 1)
+            dd = Gtk.DropDown.new_from_strings([TERMINALS[n].label for n in terminals])
+            dd.set_selected(terminals.index(TERMINAL.name))
+            dd.connect("notify::selected", self.on_terminal, terminals)
+            grid.attach(dd, 1, row, 1, 1)
+            row += 1
         rows = [("Theme", "theme", list(self.themes))]
         for heading, opts in OPTION_GROUPS:
-            rows.append((heading, None, None))
-            if heading == "Text":
-                rows.append(("Font", "font_family", self.fonts))
+            group = [("Font", "font_family", self.fonts)] if heading == "Text" else []
             for label, key, choices, _d in opts:
-                rows.append((label, key, ["auto", *self.fonts] if choices is FONT_CHOICES else choices))
+                if TERMINAL.supports(key):
+                    group.append((label, key, TERMINAL.choices(
+                        key, ["auto", *self.fonts] if choices is FONT_CHOICES else choices)))
+                if not TERMINAL.kitty_only:
+                    continue
                 if key == "cursor_trail" and len(TRAIL_STYLES) > 1:
-                    rows.append(("Trail style", "trail_style", list(TRAIL_STYLES)))
+                    group.append(("Trail style", "trail_style", list(TRAIL_STYLES)))
                 if key == "tab_bar_align":
-                    rows.append(("Tab bar style", "tab_bar", list(TAB_STYLES)))
+                    group.append(("Tab bar style", "tab_bar", list(TAB_STYLES)))
                 if key == "hide_window_decorations" and len(EFFECTS) > 1:
-                    rows.append(("Effect", "effect", list(EFFECTS)))
+                    group.append(("Effect", "effect", list(EFFECTS)))
+            if group:
+                rows += [(heading, None, None), *group]
         if self.prompt_choices:
             rows.append(("Prompt", None, None))
             rows.append(("Prompt", "prompt_mode", self.prompt_choices))
@@ -2850,6 +2938,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         shaders = conf.get("custom_shaders", "").split()
         s["trail_style"] = shader_pick(shaders, TRAIL_STYLES)[1] or "plain"
         s["effect"] = shader_pick(shaders, EFFECTS)[1] or "none"
+        s.update(TERMINAL.neutral or {})
         s["theme"] = BASE_LABEL
         name, theme_text = TERMINAL.theme()
         if name and name.startswith(SHARED_THEME) and name not in self.themes:
@@ -2890,6 +2979,17 @@ class StylerWindow(Gtk.ApplicationWindow):
             self.show_dependent(parent)
         self.syncing = False
         self.refresh()
+
+    def on_terminal(self, dd, _pspec, terminals):
+        name = terminals[dd.get_selected()]
+        if name == TERMINAL.name:
+            return
+        # Everything (rows, themes, the shell, Noctalia) depends on the terminal: build a new window
+        # from its config. Changes not applied yet are dropped, like Reset does.
+        set_terminal(name, remember=True)
+        app = self.get_application()
+        self.destroy()
+        StylerWindow(app).present()
 
     def on_step(self, _btn, dd, delta):
         dd.set_selected((dd.get_selected() + delta) % len(dd.choices))
@@ -3032,7 +3132,8 @@ class StylerWindow(Gtk.ApplicationWindow):
             notes.append("Some shell settings are left out: zsh, or the zsh plugin they change, isn't "
                          "set up here.")
         if "kitty" in skipped:
-            notes.append("Some kitty options are left out: this Kitty Styler or kitty doesn't have them.")
+            notes.append(f"Some {TERMINAL.label} options are left out: this Kitty Styler or "
+                         f"{TERMINAL.label} doesn't have them.")
         if incoming.get("prompt_mode") == "base" and "prompt_mode" in values:
             notes.append("They use their shell's own prompt, which a share code can't carry. You get your "
                          "shell's own prompt.")
@@ -3113,7 +3214,8 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.settings.update(values)
         self.sync_dropdowns()
         self.ensure_render()
-        self.status.set_label("Loaded the share code. Press Apply to keep it, or Try in kitty to test it first.")
+        self.status.set_label("Loaded the share code. Press Apply to keep it"
+                              + (", or Try in kitty to test it first." if TERMINAL.kitty_only else "."))
         # starship last: it ends in a restart.
         queue = sorted(installs, key=lambda name: name == "starship")
         if "starship" in queue:
@@ -3199,7 +3301,9 @@ class StylerWindow(Gtk.ApplicationWindow):
         # they would override the row after Apply.
         options = {key for _l, key, _c, _d in OPTIONS}
         colors = {k: v for k, v in color_snapshot(self.theme_conf()).items() if k not in options}
-        return make_share_code(self.settings, colors, starship or None)
+        # Settings this terminal doesn't have only hold values that turn them off; leave them out.
+        settings = {k: v for k, v in self.settings.items() if TERMINAL.supports(k)}
+        return make_share_code(settings, colors, starship or None)
 
     def refresh(self):
         name = self.settings["theme"]
@@ -3215,11 +3319,10 @@ class StylerWindow(Gtk.ApplicationWindow):
         elif name == BASE_LABEL:
             note = ""
         elif TERMINAL.noctalia:
-            note = ("Kitty and the starship prompt will stop following Noctalia's wallpaper colours. "
-                    "Pick Noctalia again to go back.")
+            note = (f"{TERMINAL.label.capitalize()} and the starship prompt will stop following Noctalia's "
+                    "wallpaper colours. Pick Noctalia again to go back.")
         else:
-            note = (f"Apply saves this theme as themes/kitty-styler.conf and includes it at the end of kitty.conf. "
-                    f'Pick "{BASE_LABEL}" to go back to your own colours.')
+            note = TERMINAL.theme_note()
         self.theme_note.set_label(note)
         self.theme_note.set_visible(bool(note))
         if self.prompt_choices:
@@ -3264,7 +3367,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         if mode == "base":
             name = render[0] if isinstance(render, tuple) else ""
             name = name if name and not name.endswith(" prompt") else "its own prompt"
-            out = f"Kitty starts {KITTY_SHELL}, and its prompt is {name}. Apply leaves it as it is."
+            out = f"{TERMINAL.label.capitalize()} starts {KITTY_SHELL}, and its prompt is {name}. Apply leaves it as it is."
             if strip_switch(read(SHELL_RC[KITTY_SHELL]).splitlines())[1]:
                 out += f" Apply removes Kitty Styler's starship lines from {rc}."
         else:
@@ -3510,7 +3613,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.render_gen += 1
         self.sync_dropdowns()
         self.ensure_render()
-        self.status.set_label("Reset to what kitty.conf has now.")
+        self.status.set_label(f"Reset to what {os.path.basename(TERMINAL.conf)} has now.")
 
     def on_try(self, btn):
         btn.set_sensitive(False)
@@ -3749,7 +3852,7 @@ def apply_all(s, themes, colors, file_conf, reload=True):
     picked = [EFFECTS.get(s["effect"]), TRAIL_STYLES.get(s["trail_style"])]
     if reload:
         TERMINAL.reload()
-    msg = [f"Applied and reloaded open {TERMINAL.name} windows."]
+    msg = [f"Applied and reloaded open {TERMINAL.label} windows.", *getattr(TERMINAL, "notes", [])]
     if backup:
         msg.append(f"Backup: {backup}")
     if any(picked) and not SLANGC:
@@ -3768,7 +3871,8 @@ def apply_all(s, themes, colors, file_conf, reload=True):
     if KITTY_SHELL and mode:
         msg.append(apply_switch(KITTY_SHELL, mode != "base" and bool(STARSHIP_BIN)
                                 and not own_starship(KITTY_SHELL)))
-    if TERMINAL.noctalia or STARSHIP_BEGIN in read(STARSHIP_CONF).splitlines():
+    # starship.toml is shared by every terminal; only kitty's theme moves its palette for now.
+    if TERMINAL.kitty_only and (TERMINAL.noctalia or STARSHIP_BEGIN in read(STARSHIP_CONF).splitlines()):
         # Without Noctalia the prompt's colour names already follow kitty's colours; this
         # branch then only cleans up a palette left from before.
         msg.append(apply_starship(s["theme"] if TERMINAL.noctalia else BASE_LABEL, colors))
