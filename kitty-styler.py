@@ -1238,10 +1238,19 @@ class Trail(Gtk.Widget):
                 cr.fill()
 
 
-class Preview(Gtk.DrawingArea):
+class Preview(Gtk.Widget):
+    """The kitty mock-up, drawn with cairo into a texture that is kept until queue_draw.
+
+    Not a DrawingArea: GTK's Vulkan renderer replays a DrawingArea's cairo drawing wherever
+    anything on top changes, so every cursor trail frame redrew the wallpaper and text under
+    it (30-40 ms a frame for blaze and lightning, 70 ms for the whole preview).
+    """
+
     def __init__(self, app):
         super().__init__(hexpand=True, vexpand=True)
         self.app = app
+        # (width, height, scale, texture) of the last drawing; None after queue_draw.
+        self.texture = None
         wp = wallpaper_path()
         try:
             self.wallpaper = GdkPixbuf.Pixbuf.new_from_file(wp) if wp else None
@@ -1260,7 +1269,27 @@ class Preview(Gtk.DrawingArea):
         motion.connect("enter", self.on_hover, True)
         motion.connect("leave", self.on_hover, False)
         self.add_controller(motion)
-        self.set_draw_func(self.draw)
+
+    def queue_draw(self):
+        self.texture = None
+        super().queue_draw()
+
+    def do_snapshot(self, snapshot):
+        w, h = self.get_width(), self.get_height()
+        if w < 1 or h < 1:
+            return
+        native = self.get_native()
+        scale = native.get_surface().get_scale() if native and native.get_surface() else self.get_scale_factor()
+        if self.texture is None or self.texture[:3] != (w, h, scale):
+            pw, ph = math.ceil(w * scale), math.ceil(h * scale)
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, pw, ph)
+            surf.set_device_scale(pw / w, ph / h)
+            self.draw(self, cairo.Context(surf), w, h)
+            surf.flush()
+            tex = Gdk.MemoryTexture.new(pw, ph, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                                        GLib.Bytes.new(bytes(surf.get_data())), surf.get_stride())
+            self.texture = (w, h, scale, tex)
+        snapshot.append_texture(self.texture[3], Graphene.Rect().init(0, 0, w, h))
 
     def on_hover(self, _ctl, *args):
         self.hover = args[-1]
