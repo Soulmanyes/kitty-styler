@@ -113,9 +113,11 @@ config file is copied to `<file>.bak-<date>-<time>`; the newest 5 are kept.
 
 - **alacritty.toml**: settings it already has are edited in place, keeping its formatting. New ones go in
   `shellac.toml` next to it, added to `[general] import` (one path per line). Alacritty reloads by itself.
-- **Theme**: the colours go in `shellac.toml` too. Settings in alacritty.toml itself win over its imports,
-  so while a theme is picked, alacritty.toml's `[colors]` tables wait in `alacritty-colors.shellac.toml`
-  (also imported, before `shellac.toml`). Picking the first theme entry puts them back unchanged.
+- **Theme**: the colours go in a block at the end of alacritty.toml, between `# >>> SHELLAC THEME >>>`
+  markers. Settings in alacritty.toml itself win over every import, Noctalia's included, wherever its
+  hook puts it. While a theme is picked, alacritty.toml's own `[colors]` tables wait in
+  `alacritty-colors.shellac.toml` (imported, so their other keys still apply). Picking the first theme
+  entry takes the block out and puts them back unchanged.
 - Settings Shellac can't express exactly (different x and y padding, `blinking = "Never"`, transparent
   decorations) are left alone unless you change that row.
 

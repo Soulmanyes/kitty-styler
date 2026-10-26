@@ -1314,9 +1314,10 @@ ALACRITTY_FONTS = {"font_family": "normal", "bold_font": "bold", "italic_font": 
 
 class AlacrittyTerminal:
     """Alacritty. Keys alacritty.toml sets itself are edited in place (the main file wins over its
-    imports); the rest go in shellac.toml, imported last. A picked theme's colours go there too,
-    and while one is picked the [colors] tables of alacritty.toml wait in alacritty-colors.shellac.toml,
-    imported before ours, so they don't win over it. Picking the base theme puts them back."""
+    imports); the rest go in shellac.toml, imported last. A picked theme's colours go in a block at
+    the end of alacritty.toml, so no import (Noctalia's included) beats them. While a theme is picked
+    the file's own [colors] tables wait in alacritty-colors.shellac.toml, imported, so their other keys
+    still apply. Picking the base theme puts them back."""
 
     name = "alacritty"
     label = "Alacritty"
@@ -1339,6 +1340,8 @@ class AlacrittyTerminal:
     NOCTALIA_IMPORT = "noctalia.toml"
     THEME_LINE = "# Theme: "
     IMPORT_LINE = "# Shellac original import: "
+    THEME_BEGIN = "# >>> SHELLAC THEME >>>"
+    THEME_END = "# <<< SHELLAC THEME <<<"
     ANCHOR_LINE = "# Shellac puts this back before: "
 
     def __init__(self, conf=None):
@@ -1364,21 +1367,42 @@ class AlacrittyTerminal:
         rel = os.path.relpath(path, self.dir)
         return rel if not rel.startswith("..") else path
 
-    def resolve(self, entry):
+    def resolve(self, entry, base=None):
+        """An import path as alacritty reads it: relative paths are relative to the importing file."""
         entry = os.path.expanduser(entry)
-        return os.path.normpath(entry if os.path.isabs(entry) else os.path.join(self.dir, entry))
+        return os.path.normpath(entry if os.path.isabs(entry) else os.path.join(base or self.dir, entry))
+
+    def strip_theme(self, lines):
+        """Take the theme block out of alacritty.toml's lines (in place); returns its lines."""
+        begin = next((i for i, line in enumerate(lines) if line == self.THEME_BEGIN), None)
+        if begin is None:
+            return []
+        end = next((i for i in range(begin, len(lines)) if lines[i] == self.THEME_END), len(lines) - 1)
+        block = lines[begin:end + 1]
+        start = begin - 1 if begin > 0 and not lines[begin - 1].strip() else begin
+        del lines[start:end + 1]
+        return block
+
+    def own_conf(self):
+        """alacritty.toml without the theme block: what the user set there."""
+        lines = read(self.conf).splitlines()
+        self.strip_theme(lines)
+        try:
+            return tomllib.loads("\n".join(lines))
+        except tomllib.TOMLDecodeError:
+            return {}
 
     def imports(self, data):
         value = deep_get(data, ("general", "import"), data.get("import", []))
         return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
-    def merged(self, skip=(), path=None, depth=0):
+    def merged(self, skip=(), path=None, depth=0, without_theme=False):
         """The config as alacritty sees it: imports in order, then the file itself."""
         path = path or self.conf
-        data = toml_file(path)
+        data = self.own_conf() if without_theme and path == self.conf else toml_file(path)
         out = {}
         for entry in self.imports(data):
-            target = self.resolve(entry)
+            target = self.resolve(entry, os.path.dirname(path))
             if target not in skip and os.path.isfile(target) and depth < 5:
                 deep_merge(out, self.merged(skip, target, depth + 1))
         return deep_merge(out, data)
@@ -1388,7 +1412,7 @@ class AlacrittyTerminal:
         imports = self.imports(toml_file(self.conf))
         on = any(entry.endswith(self.NOCTALIA_IMPORT) for entry in imports) and os.path.exists(self.noctalia_theme)
         # The main file's own colours win over Noctalia's (also while they wait in the side file).
-        own = deep_get(toml_file(self.conf), ("colors",)) or os.path.exists(self.side)
+        own = deep_get(self.own_conf(), ("colors",)) or os.path.exists(self.side)
         return bool(on and not own and '"alacritty"' in read(NOCTALIA_SETTINGS))
 
     def to_kitty(self, data):
@@ -1447,15 +1471,23 @@ class AlacrittyTerminal:
 
     def read_conf(self, without_theme=False):
         return {**TERMINAL_DEFAULT_COLORS["alacritty"],
-                **self.to_kitty(self.merged(skip={self.managed} if without_theme else ()))}
+                **self.to_kitty(self.merged(skip={self.managed} if without_theme else (),
+                                            without_theme=without_theme))}
 
     def theme(self):
-        text = read(self.managed)
-        first = text.split("\n", 1)[0]
-        if not first.startswith(self.THEME_LINE):
-            return None, ""
-        colors = self.to_kitty(toml_file(self.managed))
-        return first[len(self.THEME_LINE):].strip(), "".join(
+        block = self.strip_theme(read(self.conf).splitlines())
+        if len(block) > 1 and block[1].startswith(self.THEME_LINE):
+            name, body = block[1], "\n".join(line for line in block[2:] if line != self.THEME_END)
+        else:
+            # Shellac 1.4.0 kept the theme in shellac.toml.
+            name, body = read(self.managed).split("\n", 1)[0], read(self.managed)
+            if not name.startswith(self.THEME_LINE):
+                return None, ""
+        try:
+            colors = self.to_kitty(tomllib.loads(body))
+        except tomllib.TOMLDecodeError:
+            colors = {}
+        return name[len(self.THEME_LINE):].strip(), "".join(
             f"{k} {colors[k]}\n" for k in ALACRITTY_COLORS if k in colors)
 
     def noctalia_colors(self):
@@ -1554,6 +1586,7 @@ class AlacrittyTerminal:
         text = read(self.conf)
         lines = text.splitlines()
         before = tomllib.loads(text) if text else {}
+        self.strip_theme(lines)
         old_managed = toml_file(self.managed)
         # Decide per setting, not per alacritty value: the mapping loses detail (padding x and y,
         # blinking "Never" or "Always"), so a setting left alone must not touch the file.
@@ -1573,21 +1606,31 @@ class AlacrittyTerminal:
                                          "it is set there in a form Shellac can't edit.")
                 elif key in changed or deep_get(old_managed, path) is not None:
                     deep_set(managed, path, value)
+        # A picked theme's colours go in a block at the end of alacritty.toml itself: the file wins
+        # over every import, so Noctalia's import can't beat them, wherever its hook puts it.
         theme = s["theme"] if s["theme"] != BASE_LABEL else None
-        side_text = None
+        side_text, theme_block = None, []
         if theme:
-            colors = parse_conf(themes[theme])
+            colors, table = parse_conf(themes[theme]), {}
             for key, path in ALACRITTY_COLORS.items():
                 if hex_color(colors.get(key, "")):
-                    deep_set(managed, path, hex_color(colors[key]))
+                    deep_set(table, path, hex_color(colors[key]))
+            body = toml_dump(table)
+            while body and not body[0]:
+                body.pop(0)
+            theme_block = [self.THEME_BEGIN, self.THEME_LINE + theme,
+                           "# Written by Shellac; pick the first theme entry to take it out again.", *body,
+                           self.THEME_END]
             if not os.path.exists(self.side):
                 side_text = self.move_colors_out(lines)
         elif os.path.exists(self.side):
             self.move_colors_back(lines)
         side_on = bool(side_text) or (theme and os.path.exists(self.side))
         wanted_ours = ([self.import_path(self.side)] if side_on else []) + \
-                      ([self.import_path(self.managed)] if managed or theme else [])
+                      ([self.import_path(self.managed)] if managed or side_on else [])
         saved = self.set_imports(lines, wanted_ours)
+        if theme_block:
+            lines += ([""] if lines else []) + theme_block  # strip_theme takes the blank line out again
         new_text = "\n".join(lines) + ("\n" if lines else "")
         try:
             after = tomllib.loads(new_text)
@@ -1614,8 +1657,7 @@ class AlacrittyTerminal:
         if side_text:
             write_atomic(self.side, side_text)
         if wanted_ours:
-            head = ([self.THEME_LINE + theme] if theme else []) + \
-                   ["# Written by Shellac, imported last from alacritty.toml. Changes here are overwritten."]
+            head = ["# Written by Shellac, imported last from alacritty.toml. Changes here are overwritten."]
             if saved:
                 head.append(self.IMPORT_LINE + json.dumps(saved))
             write_atomic(self.managed, "\n".join(head + toml_dump(managed)) + "\n")
