@@ -31,6 +31,8 @@ Every change shows up in a live preview before anything is written.
   colours, the first theme entry follows its wallpaper colours, and the app works alongside Noctalia's
   templates.
 
+![The Shell (zsh) section: oh-my-zsh plugins, colours while typing and behaviour options](docs/screenshot-zsh.png)
+
 ## What it changes
 
 - **kitty.conf**: settings already in the file are edited in place. New ones go into a block at the end,
