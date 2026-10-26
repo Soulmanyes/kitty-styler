@@ -846,8 +846,8 @@ def ansi_rows(text):
                         c = c if c < 16 else xterm_color(c)
                         i += 2
                     elif nums[i + 1] == 2 and i + 4 < len(nums):
-                        r, g, b = nums[i + 2:i + 5]
-                        c = f"#{r:02x}{g:02x}{b:02x}"
+                        red, green, blue = nums[i + 2:i + 5]
+                        c = f"#{red:02x}{green:02x}{blue:02x}"
                         i += 4
                     else:
                         c = None
