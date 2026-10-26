@@ -34,6 +34,12 @@ Every change shows up in a live preview before anything is written.
 - **Try in kitty**: opens a real kitty window with the settings as they are in the app, shader effects
   and trail styles included, without saving anything. It runs Apply on temporary copies of your
   kitty.conf, starship.toml and shell config, and the copies are deleted when the window closes.
+- **Share codes**: **Share…** copies everything picked in the app (kitty options, theme, prompt, shell
+  settings and plugins) as one code to send to a friend, and loads a code someone sent you into the app.
+  Nothing changes until you press Apply. Before loading, it lists what your PC doesn't have (a theme,
+  font or plugin, or this kitty version lacking an option), keeps your own setting for those, and offers
+  to install `slangc` or starship when the code needs them. A code only sets values the app offers
+  itself, so it can't slip anything else into your config files.
 - **Prompt**: keep your own prompt, switch the shell to starship with your own `starship.toml`, or style
   starship here: segment styles (plain, bubbles, arrows, slanted, blocks), one or two lines, and per-part
   colours for the OS icon, user and host, folder, git, error code, duration, language versions and clock.
