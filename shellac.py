@@ -72,8 +72,8 @@ BLOCK_END = "# END_KITTY_STYLER"
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
 APP_ID = "io.github.soulmanyes.Shellac"
-VERSION = "1.3.1"
-REPO = "Soulmanyes/kitty-styler"
+VERSION = "1.4.0"
+REPO = "Soulmanyes/shellac"
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
 UPDATE_STATE = os.path.join(CONFIG_HOME, "shellac", "updates.json")
 

@@ -4,7 +4,7 @@
 # Shellac was called Kitty Styler before 1.4.0; an old install is moved over.
 # Run ./install.sh --uninstall to remove it again.
 # Without cloning the repo:
-#   curl -fsSL https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Soulmanyes/shellac/main/install.sh | sh
 # The whole script is one { } block, so a download cut off midway runs nothing.
 {
 set -eu
@@ -40,9 +40,9 @@ if [ ! -f "$SRC/shellac.py" ]; then
     trap 'rm -rf "$tmp"' EXIT
     say "Downloading Shellac"
     tag=$(curl -fsSLo /dev/null -w '%{url_effective}' \
-        https://github.com/Soulmanyes/kitty-styler/releases/latest | sed -n 's|.*/tag/||p')
+        https://github.com/Soulmanyes/shellac/releases/latest | sed -n 's|.*/tag/||p')
     ref=${tag:+tags/$tag}
-    curl -fsSL "https://github.com/Soulmanyes/kitty-styler/archive/refs/${ref:-heads/main}.tar.gz" |
+    curl -fsSL "https://github.com/Soulmanyes/shellac/archive/refs/${ref:-heads/main}.tar.gz" |
         tar -xz -C "$tmp" --strip-components=1
     sh "$tmp/install.sh" "$@" < /dev/tty
     exit
