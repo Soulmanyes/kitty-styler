@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Kitty Styler: pick kitty's look from dropdowns and see it live before applying."""
+import base64
 import glob
 import json
 import math
@@ -21,6 +22,7 @@ import tomllib
 import urllib.request
 import warnings
 import zipfile
+import zlib
 
 import cairo
 import gi
@@ -584,6 +586,25 @@ def mono_fonts():
         out = ""
     fams = {line.split(",")[0].strip() for line in out.splitlines() if line.strip()}
     return ["monospace"] + sorted(fams, key=str.lower)
+
+
+def font_names():
+    """Every name kitty can find an installed font by, lowercased: family, family + style,
+    full name and PostScript name (e.g. "JetBrainsMono Nerd Font ExtraBold")."""
+    try:
+        out = subprocess.run(["fc-list", ":", "family", "style", "fullname", "postscriptname"],
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        out = ""
+    names = set()
+    for line in out.splitlines():
+        fields = dict(part.split("=", 1) for part in line.split(":")[1:] if "=" in part)
+        families = [f.strip() for f in line.split(":")[0].split(",") if f.strip()]
+        styles = [st.strip() for st in fields.get("style", "").split(",") if st.strip()]
+        names.update(families)
+        names.update(f"{f} {st}" for f in families for st in styles)
+        names.update(v.strip() for k, v in fields.items() if k in ("fullname", "postscriptname"))
+    return {n.lower() for n in names}
 
 
 def wallpaper_path():
@@ -1746,6 +1767,115 @@ class PluginPicker(Gtk.Window):
         self.win.refresh()
 
 
+class ShareWindow(Gtk.Window):
+    """Copy a share code of the current settings, or paste one to load."""
+
+    def __init__(self, win):
+        super().__init__(transient_for=win, modal=True, title="Share settings", default_width=560)
+        self.win = win
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=16, margin_bottom=16,
+                      margin_start=16, margin_end=16)
+
+        def text(label, heading=False):
+            widget = Gtk.Label(label=label, xalign=0, wrap=True, max_width_chars=60)
+            widget.add_css_class("heading" if heading else "dim-label")
+            box.append(widget)
+            return widget
+
+        text("Your settings", heading=True)
+        text("Everything picked here, also what isn't applied yet: kitty options, theme, prompt and shell.")
+        code = make_share_code(win.settings)
+        row = Gtk.Box(spacing=8)
+        shown = Gtk.Entry(text=code, editable=False, hexpand=True)
+        copy = Gtk.Button(label="Copy")
+        copy.add_css_class("suggested-action")
+        copy.connect("clicked", self.on_copy, code)
+        row.append(shown)
+        row.append(copy)
+        box.append(row)
+        self.copied = text("")
+        self.copied.set_visible(False)
+
+        heading = text("Load a share code", heading=True)
+        heading.set_margin_top(12)
+        text("Loads the settings into this window. Nothing changes in kitty until you press Apply.")
+        row = Gtk.Box(spacing=8)
+        self.paste = Gtk.Entry(placeholder_text=f"Paste a code starting with {SHARE_PREFIX}", hexpand=True)
+        self.paste.connect("activate", self.on_load)
+        load = Gtk.Button(label="Load")
+        load.connect("clicked", self.on_load)
+        row.append(self.paste)
+        row.append(load)
+        box.append(row)
+        self.error = text("")
+        self.error.set_visible(False)
+        self.set_child(box)
+
+    def on_copy(self, _btn, code):
+        self.get_clipboard().set_content(Gdk.ContentProvider.new_for_bytes(
+            "text/plain;charset=utf-8", GLib.Bytes.new(code.encode())))
+        self.copied.set_label("Copied. Send it to anyone with Kitty Styler.")
+        self.copied.set_visible(True)
+
+    def on_load(self, _widget):
+        try:
+            data = read_share_code(self.paste.get_text())
+        except ValueError as e:
+            self.error.set_label(str(e))
+            self.error.set_visible(True)
+            return
+        self.close()
+        self.win.load_share(data, self.paste.get_text())
+
+
+class ImportCheck(Gtk.Window):
+    """What in a share code doesn't fit this PC, with installs to tick, before loading the rest."""
+
+    def __init__(self, win, notes, installs, on_done, heading=None, ok_label=None, cancel_label="Cancel",
+                 on_cancel=None):
+        super().__init__(transient_for=win, modal=True, title="Load share code", default_width=520)
+        self.on_done, self.on_cancel = on_done, on_cancel
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=16, margin_bottom=16,
+                      margin_start=16, margin_end=16)
+        heading = heading or ("Some of this share code doesn't fit this PC:" if notes else
+                              "This share code uses something that needs installing:")
+        head = Gtk.Label(label=heading, xalign=0, wrap=True, max_width_chars=60)
+        head.add_css_class("heading")
+        box.append(head)
+        for note in notes:
+            box.append(Gtk.Label(label=f"• {note}", xalign=0, wrap=True, max_width_chars=60))
+        self.checks = {}
+        for name, why in installs:
+            check = Gtk.CheckButton(label=f"Install {name}: {why}", active=True)
+            self.checks[name] = check
+            box.append(check)
+        if installs:
+            tip = Gtk.Label(label="Installing may ask for your password.", xalign=0)
+            tip.add_css_class("dim-label")
+            box.append(tip)
+        buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END, margin_top=8)
+        cancel = Gtk.Button(label=cancel_label)
+        cancel.connect("clicked", self.on_cancel_clicked)
+        go = Gtk.Button(label=ok_label or ("Load the rest" if notes else "Load"))
+        go.add_css_class("suggested-action")
+        go.connect("clicked", self.on_go)
+        buttons.append(cancel)
+        buttons.append(go)
+        box.append(buttons)
+        self.set_child(box)
+        self.set_default_widget(go)
+        go.grab_focus()
+
+    def on_go(self, _btn):
+        self.close()
+        self.on_done([name for name, check in self.checks.items() if check.get_active()])
+
+    def on_cancel_clicked(self, _btn):
+        self.close()
+        if self.on_cancel:
+            self.on_cancel()
+
+
 class StylerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Kitty Styler", default_width=1350, default_height=780)
@@ -1774,17 +1904,22 @@ class StylerWindow(Gtk.ApplicationWindow):
         apply_btn.connect("clicked", self.on_apply)
         reset_btn = Gtk.Button(label="Reset to current")
         reset_btn.connect("clicked", self.on_reset)
+        share_btn = Gtk.Button(label="Share…", tooltip_text="Copy these settings as a code, or load someone's code")
+        share_btn.connect("clicked", lambda _b: ShareWindow(self).present())
         try_btn = Gtk.Button(label="Try in kitty",
                              tooltip_text="Open a kitty window with these settings, without saving them")
         try_btn.connect("clicked", self.on_try)
         header.pack_end(apply_btn)
         header.pack_end(try_btn)
         header.pack_start(reset_btn)
+        header.pack_start(share_btn)
         self.set_titlebar(header)
 
         grid = Gtk.Grid(row_spacing=10, column_spacing=12, margin_top=16, margin_bottom=16,
                         margin_start=16, margin_end=16)
         self.dropdowns = {}
+        # Row names, for what a share code couldn't load.
+        self.row_labels = {}
         row = 0
         rows = [("Theme", "theme", list(self.themes))]
         for heading, opts in OPTION_GROUPS:
@@ -1854,6 +1989,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             notes = CHOICE_NOTES.get(key, {})
             dd = Gtk.DropDown.new_from_strings([notes.get(ch, ch) for ch in choices])
             dd.choices = choices
+            self.row_labels[key] = label
             dd.set_hexpand(True)
             if len(choices) > 15 or key == "theme":
                 dd.set_enable_search(True)
@@ -1945,6 +2081,17 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.ensure_render()
         if updater:
             self.check_update()
+        # Install queue of the last share code load, and its code while starship needs a restart.
+        self.share_installs = []
+        self.share_code = None
+        self.font_names = None
+        if os.path.exists(PENDING_IMPORT):
+            code = read(PENDING_IMPORT)
+            os.remove(PENDING_IMPORT)
+            try:
+                GLib.idle_add(self.load_share, read_share_code(code), code)
+            except ValueError:
+                pass
 
     # ---- updates ----
     def make_update_banner(self):
@@ -2149,7 +2296,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         for boxes in self.extra_boxes.values():
             for _box, _label, btn in boxes:
                 btn.set_sensitive(False)
-        for _box, _label, btn in self.extra_boxes[name]:
+        for _box, _label, btn in self.extra_boxes.get(name, []):
             btn.set_label("Installing…")
         self.status.set_label(f"Installing {name}…")
 
@@ -2168,7 +2315,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         for boxes in self.extra_boxes.values():
             for _box, _label, btn in boxes:
                 btn.set_sensitive(True)
-        for box, label, btn in self.extra_boxes[name]:
+        for box, label, btn in self.extra_boxes.get(name, []):
             if not ok:
                 btn.set_label("Install")
             elif not find_extra(name):
@@ -2186,7 +2333,126 @@ class StylerWindow(Gtk.ApplicationWindow):
                                                                            os.path.abspath(sys.argv[0])]))
         if name == "slangc":
             SLANGC = find_extra("slangc")
+        if name == "starship" and self.share_code:
+            if ok and find_extra("starship"):
+                code = self.share_code
+
+                def restart(_installs):
+                    write_atomic(PENDING_IMPORT, code)
+                    os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
+                ImportCheck(self, [("Kitty Styler restarts, then loads the share code again with its prompt "
+                                    "settings. Changes not applied yet are lost.")], [], restart,
+                            heading="starship is installed.", ok_label="Restart now", cancel_label="Later",
+                            on_cancel=lambda: self.status.set_label(
+                                "starship is installed. Load the share code again after restarting Kitty "
+                                "Styler to get its prompt settings.")).present()
+            self.share_code = None
+        if self.share_installs:
+            self.on_install(None, self.share_installs.pop(0))
         return False
+
+    # ---- share codes ----
+    def check_import(self, data):
+        """Split a share code into values to load and notes on what doesn't fit this PC.
+
+        Returns (values, notes, installs). Only values the app offers itself get through: the
+        dropdown's own choices, numbers for kitty options, installed fonts, themes and plugins."""
+        incoming, values, notes, installs, skipped = data["settings"], {}, [], [], {}
+        numeric = {key for _l, key, _c, _d in OPTIONS}
+        for key, value in incoming.items():
+            if key == "theme":
+                if value is None:
+                    if data.get("noctalia") and NOCTALIA:
+                        values[key] = BASE_LABEL
+                    elif data.get("noctalia"):
+                        notes.append("The theme follows the wallpaper through Noctalia, which isn't set up "
+                                     "here. Your colours stay.")
+                    else:
+                        notes.append("The sharer kept their own kitty colours, which aren't in the code. "
+                                     "Your colours stay.")
+                elif isinstance(value, str) and value in self.themes:
+                    values[key] = value
+                else:
+                    notes.append(f'The theme "{value}" isn\'t available here. Your colours stay.')
+                continue
+            if key == "z_plugins":
+                if not isinstance(value, list):
+                    continue
+                if not (ZSH_AVAILABLE and self.zsh_info["omz"]):
+                    notes.append("oh-my-zsh isn't set up here, so its plugins are left out.")
+                    continue
+                if self.plugin_catalogue is None:
+                    self.plugin_catalogue = omz_plugins(self.zsh_info)
+                have = [v for v in value if isinstance(v, str) and v in self.plugin_catalogue
+                        and not loaded_elsewhere(v, self.zsh_info)]
+                missing = [v for v in value if isinstance(v, str) and v not in self.plugin_catalogue]
+                values[key] = have
+                if missing:
+                    notes.append(f"oh-my-zsh plugins not installed here, left out: {', '.join(missing)}.")
+                continue
+            dd = self.dropdowns.get(key)
+            if dd is None:
+                group = "prompt" if key == "prompt_mode" or key.startswith("p_") else \
+                        "shell" if key.startswith("z_") else "kitty"
+                skipped.setdefault(group, []).append(key)
+                continue
+            # dd.choices also holds this PC's own kitty.conf values, which are safe to take back.
+            pick = next((ch for ch in dd.choices if isinstance(value, str) and same(ch, value)), None)
+            if pick is None and key in numeric and isinstance(value, str) and SHARE_NUMBER.fullmatch(value):
+                pick = value
+            if pick is None and key in FONT_KEYS and isinstance(value, str) and value.isprintable() \
+                    and len(value) < 200:
+                if self.font_names is None:
+                    self.font_names = font_names()
+                if value.lower() in self.font_names:
+                    pick = value
+            if pick is None:
+                label = self.row_labels.get(key, key)
+                what = "isn't installed here" if key in FONT_KEYS else "isn't available here"
+                shown = " ".join(str(value).split())
+                shown = shown if len(shown) <= 40 else shown[:39] + "…"
+                notes.append(f'{label}: "{shown}" {what}. Yours stays.')
+                continue
+            values[key] = pick
+        if not SLANGC and (TRAIL_STYLES.get(values.get("trail_style")) or EFFECTS.get(values.get("effect"))):
+            installs.append(("slangc", EXTRAS["slangc"]["what"]))
+        if "prompt" in skipped:
+            if incoming.get("prompt_mode") in ("styled", "starship") and not STARSHIP_BIN:
+                notes.append("The prompt settings need starship, which isn't installed.")
+                installs.append(("starship", "then Kitty Styler restarts and loads the prompt settings"))
+            else:
+                notes.append("The prompt settings are left out: Kitty Styler can't style this PC's shell prompt.")
+        if "shell" in skipped:
+            notes.append("Some shell settings are left out: zsh, or the zsh plugin they change, isn't "
+                         "set up here.")
+        if "kitty" in skipped:
+            notes.append("Some kitty options are left out: this Kitty Styler or kitty doesn't have them.")
+        return values, notes, installs
+
+    def load_share(self, data, code):
+        theme = data["settings"].get("theme")
+        if isinstance(theme, str) and theme not in self.themes:
+            # Read the theme list again (it can change while the app runs) before calling it missing.
+            self.on_reload_themes(None)
+        values, notes, installs = self.check_import(data)
+        if not notes and not installs:
+            self.use_share(values, [], code)
+        else:
+            ImportCheck(self, notes, installs, lambda chosen: self.use_share(values, chosen, code)).present()
+        return False
+
+    def use_share(self, values, installs, code):
+        self.settings.update(values)
+        self.sync_dropdowns()
+        self.ensure_render()
+        self.status.set_label("Loaded the share code. Press Apply to keep it, or Try in kitty to test it first.")
+        # starship last: it ends in a restart.
+        queue = sorted(installs, key=lambda name: name == "starship")
+        if "starship" in queue:
+            self.share_code = code
+        if queue:
+            self.share_installs = queue[1:]
+            self.on_install(None, queue[0])
 
     def on_changed(self, dd, _pspec, key):
         if self.syncing:
@@ -2596,6 +2862,53 @@ def same(a, b):
         return float(a) == float(b)
     except ValueError:
         return a == b
+
+
+# Share codes: "ks1:" + base64url(zlib(JSON)). The number goes up if the format changes, so
+# older codes keep working. A share code comes from someone else: import only takes values the
+# app offers itself (see StylerWindow.check_import), never raw text that ends up in a config file.
+SHARE_PREFIX = "ks1:"
+FONT_KEYS = ("font_family", "bold_font", "italic_font", "bold_italic_font")
+SHARE_MAX_CHARS = 20000
+SHARE_MAX_JSON = 200000
+# Numbers kitty.conf can hold that aren't in our lists, like font_size 13.5 or "2.0 2.0".
+SHARE_NUMBER = re.compile(r"-?\d+(\.\d+)?(pt|px|%)?( -?\d+(\.\d+)?(pt|px|%)?){0,3}")
+# Where an import waits while Kitty Styler restarts after installing starship.
+PENDING_IMPORT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "kitty-styler-import")
+
+
+def make_share_code(settings):
+    """The settings as a share code. The base theme travels as None: its label differs per PC."""
+    data = dict(settings)
+    if data.get("theme") == BASE_LABEL:
+        data["theme"] = None
+    blob = json.dumps({"settings": data, "noctalia": NOCTALIA}, separators=(",", ":")).encode()
+    return SHARE_PREFIX + base64.urlsafe_b64encode(zlib.compress(blob, 9)).decode().rstrip("=")
+
+
+def read_share_code(text):
+    """The {"settings": ..., "noctalia": ...} in a share code; ValueError says what is wrong."""
+    code = "".join(text.split())
+    if not code:
+        raise ValueError("Paste a share code first.")
+    if len(code) > SHARE_MAX_CHARS:
+        raise ValueError("That is too long to be a share code.")
+    if not code.startswith(SHARE_PREFIX):
+        if re.match(r"ks\d+:", code):
+            raise ValueError("That share code is from a newer Kitty Styler. Update this one first.")
+        raise ValueError(f'That is not a share code; they start with "{SHARE_PREFIX}".')
+    body = code[len(SHARE_PREFIX):]
+    try:
+        packed = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        unzip = zlib.decompressobj()
+        blob = unzip.decompress(packed, SHARE_MAX_JSON)
+        if unzip.unconsumed_tail:
+            raise ValueError
+        data = json.loads(blob)
+        data["settings"].keys()  # a dict inside a dict, or one of these errors
+    except (ValueError, zlib.error, KeyError, TypeError, AttributeError):
+        raise ValueError("That share code is damaged or incomplete. Copy it again.") from None
+    return data
 
 
 def prune_backups():
