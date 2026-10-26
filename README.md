@@ -34,12 +34,18 @@ Every change shows up in a live preview before anything is written.
 - **Try in kitty**: opens a real kitty window with the settings as they are in the app, shader effects
   and trail styles included, without saving anything. It runs Apply on temporary copies of your
   kitty.conf, starship.toml and shell config, and the copies are deleted when the window closes.
-- **Share codes**: **Share…** copies everything picked in the app (kitty options, theme, prompt, shell
-  settings and plugins) as one code to send to a friend, and loads a code someone sent you into the app.
-  Nothing changes until you press Apply. Before loading, it lists what your PC doesn't have (a theme,
-  font or plugin, or this kitty version lacking an option), keeps your own setting for those, and offers
-  to install `slangc` or starship when the code needs them. A code only sets values the app offers
-  itself, so it can't slip anything else into your config files.
+- **Share codes**: **Share…** copies everything picked in the app as one code to send to a friend (or
+  saves it to a file, for chat apps that turn long messages into files anyway), and loads a code someone
+  sent you, pasted or from the file, into the app, so both kitty windows end up looking the same. The code
+  carries the kitty options, the theme's exact colours (also Noctalia's wallpaper colours, as a fixed
+  "Shared:" theme), the prompt with the starship.toml it uses, and the shell settings and plugins. Nothing
+  changes until you press Apply, and Apply backs up what it replaces. Before loading, it lists what your
+  PC doesn't have (a font or plugin, or this kitty version lacking an option) and keeps your own setting
+  for those, and it offers to install `slangc` or starship when the code needs them. Parts of a
+  starship.toml that run programs (`[custom]` modules, `commands`, `*_binary`) are left out unless you
+  tick them. A code only sets values the app offers itself, so it can't slip anything else into your
+  config files. Not shared: fonts and oh-my-zsh plugins themselves, zsh options left at "Leave as is", and
+  kitty options the app doesn't list. Codes use only letters and digits, so chat apps can't mangle them.
 - **Prompt**: keep your own prompt, switch the shell to starship with your own `starship.toml`, or style
   starship here: segment styles (plain, bubbles, arrows, slanted, blocks), one or two lines, and per-part
   colours for the OS icon, user and host, folder, git, error code, duration, language versions and clock.

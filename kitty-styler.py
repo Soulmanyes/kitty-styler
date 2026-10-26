@@ -72,7 +72,7 @@ BLOCK_END = "# END_KITTY_STYLER"
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
 APP_ID = "io.github.soulmanyes.KittyStyler"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "Soulmanyes/kitty-styler"
 UPDATE_STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
                             "kitty-styler", "updates.json")
@@ -1767,8 +1767,14 @@ class PluginPicker(Gtk.Window):
         self.win.refresh()
 
 
+SHARE_FILE_NAME = "kitty-styler-share.txt"
+
+
 class ShareWindow(Gtk.Window):
-    """Copy a share code of the current settings, or paste one to load."""
+    """Copy or save a share code of the current settings, or paste or open one to load.
+
+    Files are for chat apps: Discord sends text over 2000 characters as a file anyway, and a file
+    arrives exactly as sent."""
 
     def __init__(self, win):
         super().__init__(transient_for=win, modal=True, title="Share settings", default_width=560)
@@ -1783,15 +1789,19 @@ class ShareWindow(Gtk.Window):
             return widget
 
         text("Your settings", heading=True)
-        text("Everything picked here, also what isn't applied yet: kitty options, theme, prompt and shell.")
-        code = make_share_code(win.settings)
+        text("Everything picked here, also what isn't applied yet: kitty options, theme colours, prompt "
+             "(with your whole starship.toml, including any [custom] commands and what they contain) and shell.")
+        code = win.make_code()
         row = Gtk.Box(spacing=8)
         shown = Gtk.Entry(text=code, editable=False, hexpand=True)
         copy = Gtk.Button(label="Copy")
         copy.add_css_class("suggested-action")
         copy.connect("clicked", self.on_copy, code)
+        save = Gtk.Button(label="Save to file…")
+        save.connect("clicked", self.on_save, code)
         row.append(shown)
         row.append(copy)
+        row.append(save)
         box.append(row)
         self.copied = text("")
         self.copied.set_visible(False)
@@ -1804,8 +1814,11 @@ class ShareWindow(Gtk.Window):
         self.paste.connect("activate", self.on_load)
         load = Gtk.Button(label="Load")
         load.connect("clicked", self.on_load)
+        open_btn = Gtk.Button(label="Open file…")
+        open_btn.connect("clicked", self.on_open)
         row.append(self.paste)
         row.append(load)
+        row.append(open_btn)
         box.append(row)
         self.error = text("")
         self.error.set_visible(False)
@@ -1816,6 +1829,62 @@ class ShareWindow(Gtk.Window):
             "text/plain;charset=utf-8", GLib.Bytes.new(code.encode())))
         self.copied.set_label("Copied. Send it to anyone with Kitty Styler.")
         self.copied.set_visible(True)
+
+    def pick_file(self, saving, done):
+        """Ask for a file to save to or open, then call done(path); nothing on cancel."""
+        if hasattr(Gtk, "FileDialog"):
+            dialog = Gtk.FileDialog(title="Save share code" if saving else "Open share code")
+
+            def finished(dlg, result):
+                try:
+                    picked = dlg.save_finish(result) if saving else dlg.open_finish(result)
+                except GLib.Error:
+                    return  # cancelled
+                if picked and picked.get_path():
+                    done(picked.get_path())
+            if saving:
+                dialog.set_initial_name(SHARE_FILE_NAME)
+                dialog.save(self, None, finished)
+            else:
+                dialog.open(self, None, finished)
+            return
+        # GTK before 4.10.
+        action = Gtk.FileChooserAction.SAVE if saving else Gtk.FileChooserAction.OPEN
+        self.chooser = Gtk.FileChooserNative.new("Save share code" if saving else "Open share code", self,
+                                                 action, "Save" if saving else "Open", "Cancel")
+        if saving:
+            self.chooser.set_current_name(SHARE_FILE_NAME)
+
+        def response(chooser, answer):
+            if answer == Gtk.ResponseType.ACCEPT and chooser.get_file() and chooser.get_file().get_path():
+                done(chooser.get_file().get_path())
+        self.chooser.connect("response", response)
+        self.chooser.show()
+
+    def on_save(self, _btn, code):
+        def save(path):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(code + "\n")
+            except OSError as e:
+                self.copied.set_label(f"Could not save: {e}")
+            else:
+                self.copied.set_label(f"Saved to {path}. Send the file; they load it with Open file….")
+            self.copied.set_visible(True)
+        self.pick_file(True, save)
+
+    def on_open(self, _btn):
+        def opened(path):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read(SHARE_MAX_CHARS + 1000)
+            except OSError as e:
+                self.error.set_label(f"Could not open the file: {e}")
+                self.error.set_visible(True)
+                return
+            self.paste.set_text(text.strip())
+            self.on_load(None)
+        self.pick_file(False, opened)
 
     def on_load(self, _widget):
         try:
@@ -1832,19 +1901,25 @@ class ImportCheck(Gtk.Window):
     """What in a share code doesn't fit this PC, with installs to tick, before loading the rest."""
 
     def __init__(self, win, notes, installs, on_done, heading=None, ok_label=None, cancel_label="Cancel",
-                 on_cancel=None):
+                 on_cancel=None, options=()):
         super().__init__(transient_for=win, modal=True, title="Load share code", default_width=520)
         self.on_done, self.on_cancel = on_done, on_cancel
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=16, margin_bottom=16,
                       margin_start=16, margin_end=16)
         heading = heading or ("Some of this share code doesn't fit this PC:" if notes else
-                              "This share code uses something that needs installing:")
+                              "This share code uses something that needs installing:" if installs else
+                              "Before loading this share code:")
         head = Gtk.Label(label=heading, xalign=0, wrap=True, max_width_chars=60)
         head.add_css_class("heading")
         box.append(head)
         for note in notes:
             box.append(Gtk.Label(label=f"• {note}", xalign=0, wrap=True, max_width_chars=60))
         self.checks = {}
+        for key, text, default in options:
+            check = Gtk.CheckButton(active=default)
+            check.set_child(Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=58))
+            self.checks[key] = check
+            box.append(check)
         for name, why in installs:
             check = Gtk.CheckButton(label=f"Install {name}: {why}", active=True)
             self.checks[name] = check
@@ -1880,6 +1955,8 @@ class StylerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Kitty Styler", default_width=1350, default_height=780)
         self.themes = load_themes()
+        # Themes made from a share code's colours: {"Shared: …": conf text}.
+        self.shared_themes = {}
         self.fonts = mono_fonts()
         self.prompt_choices = prompt_choices()
         CHOICE_NOTES["prompt_mode"] = dict(PROMPT_MODES)
@@ -2238,9 +2315,13 @@ class StylerWindow(Gtk.ApplicationWindow):
         s["effect"] = shader_pick(shaders, EFFECTS)[1] or "none"
         s["theme"] = BASE_LABEL
         if STYLER_INCLUDE in text.splitlines():
-            m = re.match(r"# Theme: (.+)", read(STYLER_THEME))
-            if m and m.group(1).strip() in self.themes:
-                s["theme"] = m.group(1).strip()
+            theme_text = read(STYLER_THEME)
+            m = re.match(r"# Theme: (.+)", theme_text)
+            name = m and m.group(1).strip()
+            if name and name.startswith(SHARED_THEME) and name not in self.themes:
+                self.add_shared_theme(name, theme_text.split("\n", 2)[2] if theme_text.count("\n") >= 2 else "")
+            if name in self.themes:
+                s["theme"] = name
         s.update(load_prompt_settings())
         styled = PROMPT_BEGIN in read(STARSHIP_CONF).splitlines()
         uses_starship = (not KITTY_SHELL or own_starship(KITTY_SHELL)
@@ -2355,25 +2436,16 @@ class StylerWindow(Gtk.ApplicationWindow):
     def check_import(self, data):
         """Split a share code into values to load and notes on what doesn't fit this PC.
 
-        Returns (values, notes, installs). Only values the app offers itself get through: the
-        dropdown's own choices, numbers for kitty options, installed fonts, themes and plugins."""
+        Returns (values, notes, installs, options, pending): options are ticks for the load dialog,
+        pending what they decide. Only values the app offers itself get through: the dropdown's own
+        choices, numbers and colours for kitty options, installed fonts, themes and plugins, colour
+        lines for a shared theme, and a starship.toml that is valid TOML."""
         incoming, values, notes, installs, skipped = data["settings"], {}, [], [], {}
+        options, pending = [], {}
         numeric = {key for _l, key, _c, _d in OPTIONS}
         for key, value in incoming.items():
             if key == "theme":
-                if value is None:
-                    if data.get("noctalia") and NOCTALIA:
-                        values[key] = BASE_LABEL
-                    elif data.get("noctalia"):
-                        notes.append("The theme follows the wallpaper through Noctalia, which isn't set up "
-                                     "here. Your colours stay.")
-                    else:
-                        notes.append("The sharer kept their own kitty colours, which aren't in the code. "
-                                     "Your colours stay.")
-                elif isinstance(value, str) and value in self.themes:
-                    values[key] = value
-                else:
-                    notes.append(f'The theme "{value}" isn\'t available here. Your colours stay.')
+                self.check_theme(value, data, values, notes, options, pending)
                 continue
             if key == "z_plugins":
                 if not isinstance(value, list):
@@ -2427,21 +2499,83 @@ class StylerWindow(Gtk.ApplicationWindow):
                          "set up here.")
         if "kitty" in skipped:
             notes.append("Some kitty options are left out: this Kitty Styler or kitty doesn't have them.")
-        return values, notes, installs
+        if incoming.get("prompt_mode") == "base" and "prompt_mode" in values:
+            notes.append("They use their shell's own prompt, which a share code can't carry. You get your "
+                         "shell's own prompt.")
+        starship = data.get("starship")
+        if isinstance(starship, str) and starship.strip() and incoming.get("prompt_mode") in ("starship", "styled"):
+            try:
+                config = tomllib.loads(starship)
+            except tomllib.TOMLDecodeError:
+                notes.append("Their starship.toml can't be read, so it is left out.")
+            else:
+                options.append(("starship", ("Use their starship.toml for the prompt. Yours is backed up when "
+                                            "you press Apply."), True))
+                runs = starship_runs(config)
+                if runs:
+                    shown = ", ".join(runs[:6]) + (f" and {len(runs) - 6} more" if len(runs) > 6 else "")
+                    options.append(("starship_runs", (f"Also keep the parts of it that run programs ({shown}). "
+                                                     "Only tick this if you trust them."), False))
+                pending["starship"] = (starship, config, runs)
+        return values, notes, installs, options, pending
+
+    def check_theme(self, value, data, values, notes, options, pending):
+        """The theme: by name when this PC has it, else a theme made from the code's colours."""
+        colors = color_snapshot(data.get("colors"))
+        if isinstance(value, str) and value in self.themes and not value.startswith(SHARED_THEME):
+            values["theme"] = value
+            return
+        if not colors:
+            # A code without colours (Kitty Styler 1.2.0).
+            if value is None and data.get("noctalia") and NOCTALIA:
+                values["theme"] = BASE_LABEL
+            elif value is None:
+                notes.append("The sharer's colours aren't in the code. Your colours stay.")
+            else:
+                notes.append(f'The theme "{value}" isn\'t available here. Your colours stay.')
+            return
+        if isinstance(value, str) and value.isprintable() and len(value) < 80:
+            label = value.removeprefix(SHARED_THEME)
+        else:
+            label = "their Noctalia colours" if data.get("noctalia") else "their colours"
+        text = "".join(f"{k} {v}\n" for k, v in colors.items())
+        ask = value is None and data.get("noctalia") and NOCTALIA
+        if ask:
+            options.append(("exact_colours", ("Use their exact colours. Otherwise Noctalia picks colours from "
+                                              "your wallpaper, like it does for them."), True))
+        pending["theme"] = (SHARED_THEME + label, text, ask)
 
     def load_share(self, data, code):
         theme = data["settings"].get("theme")
         if isinstance(theme, str) and theme not in self.themes:
             # Read the theme list again (it can change while the app runs) before calling it missing.
             self.on_reload_themes(None)
-        values, notes, installs = self.check_import(data)
-        if not notes and not installs:
-            self.use_share(values, [], code)
+        values, notes, installs, options, pending = self.check_import(data)
+        if not notes and not installs and not options:
+            self.use_share(values, [], code, pending)
         else:
-            ImportCheck(self, notes, installs, lambda chosen: self.use_share(values, chosen, code)).present()
+            ImportCheck(self, notes, installs, lambda chosen: self.use_share(values, chosen, code, pending),
+                        options=options).present()
         return False
 
-    def use_share(self, values, installs, code):
+    def use_share(self, values, chosen, code, pending):
+        if "theme" in pending:
+            name, text, ask = pending["theme"]
+            if ask and "exact_colours" not in chosen:
+                values["theme"] = BASE_LABEL
+            else:
+                self.add_shared_theme(name, text)
+                values["theme"] = name
+        self.settings.pop("shared_starship", None)
+        if "starship" in pending and "starship" in chosen:
+            text, config, runs = pending["starship"]
+            if runs and "starship_runs" not in chosen:
+                text = "\n".join(["# Shared through Kitty Styler; the parts that run programs were left out.",
+                                  *toml_dump(drop_options(config, runs))]).strip() + "\n"
+            values["shared_starship"] = text
+        self.renders.pop("starship", None)
+        self.render_gen += 1
+        installs = [name for name in chosen if name in EXTRAS]
         self.settings.update(values)
         self.sync_dropdowns()
         self.ensure_render()
@@ -2480,7 +2614,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             job = (render_shell_prompt, KITTY_SHELL)
         else:
             # starship.toml as it is without our prompt block, which Apply removes in this mode.
-            job = (render_starship, strip_prompt_block(read(STARSHIP_CONF)))
+            job = (render_starship, strip_prompt_block(self.settings.get("shared_starship") or read(STARSHIP_CONF)))
         self.renders[mode] = "pending"
         gen = self.render_gen
 
@@ -2502,8 +2636,13 @@ class StylerWindow(Gtk.ApplicationWindow):
             self.plugin_catalogue = omz_plugins(self.zsh_info)
         PluginPicker(self).present()
 
+    def add_shared_theme(self, name, text):
+        self.shared_themes[name] = text
+        self.themes[name] = text
+
     def on_reload_themes(self, _btn):
         self.themes = load_themes()
+        self.themes.update(self.shared_themes)
         dd = self.dropdowns["theme"]
         self.syncing = True
         dd.choices[:] = list(self.themes)
@@ -2511,12 +2650,26 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.syncing = False
         self.sync_dropdowns()
 
-    def refresh(self):
+    def theme_conf(self):
+        """The kitty settings of the picked theme (for the base theme: Noctalia's, or kitty.conf's)."""
         name = self.settings["theme"]
         if name != BASE_LABEL:
-            conf = parse_conf(self.themes[name])
-        else:
-            conf = parse_conf(read(NOCTALIA_THEME)) if NOCTALIA else self.base_colors
+            return parse_conf(self.themes[name])
+        return parse_conf(read(NOCTALIA_THEME)) if NOCTALIA else self.base_colors
+
+    def make_code(self):
+        starship = None
+        if self.settings.get("prompt_mode") in ("starship", "styled"):
+            starship = self.settings.get("shared_starship") or strip_styler_starship(read(STARSHIP_CONF))
+        # Colour options the app has rows for (cursor_trail_color) travel as settings; in the theme
+        # they would override the row after Apply.
+        options = {key for _l, key, _c, _d in OPTIONS}
+        colors = {k: v for k, v in color_snapshot(self.theme_conf()).items() if k not in options}
+        return make_share_code(self.settings, colors, starship or None)
+
+    def refresh(self):
+        name = self.settings["theme"]
+        conf = self.theme_conf()
         colors = dict(KITTY_COLORS)
         colors.update({k: v for k, v in conf.items() if k in colors and v.startswith("#")})
         if conf.get("active_border_color") == "none":
@@ -2829,9 +2982,10 @@ class StylerWindow(Gtk.ApplicationWindow):
         btn.set_sensitive(False)
         self.status.set_label("Opening a kitty window with these settings…")
         settings, colors = dict(self.settings), dict(self.colors)
+        themes = {settings["theme"]: self.themes[settings["theme"]]} if settings["theme"] in self.shared_themes else {}
 
         def work():
-            error = try_in_kitty(settings, colors)
+            error = try_in_kitty(settings, colors, themes)
             GLib.idle_add(done, error)
 
         def done(error):
@@ -2848,6 +3002,8 @@ class StylerWindow(Gtk.ApplicationWindow):
     def on_apply(self, _btn):
         try:
             msg = apply_all(self.settings, self.themes, self.colors, self.file_conf)
+            # Written now; a later Apply keeps whatever starship.toml has then.
+            self.settings.pop("shared_starship", None)
         except OSError as e:
             msg = f"Could not save: {e}"
         self.file_conf = parse_conf_file(CONF)
@@ -2879,16 +3035,108 @@ KS1_ITALIC_SPAN = 120
 # Numbers and colours kitty.conf can hold that aren't in our lists, like font_size 13.5,
 # "2.0 2.0" or #dde1e6.
 SHARE_NUMBER = re.compile(r"-?\d+(\.\d+)?(pt|px|%)?( -?\d+(\.\d+)?(pt|px|%)?){0,3}|#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?")
+# Theme colours a share code may carry: colour keys only (kitty also has keys like "shell"), and
+# only colour values.
+SHARE_COLOR_KEY = re.compile(r"[a-z0-9_]*(color|foreground|background)[a-z0-9_]*")
+SHARE_COLOR = re.compile(r"#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?|none")
+SHARED_THEME = "Shared: "
+# starship.toml options that make starship run a program: the [custom] modules, plus these keys
+# and any *_binary key in the other modules (starship print-config --default, 1.27).
+STARSHIP_RUNS = ("command", "commands", "when", "use_stdin", "shell")
 # Where an import waits while Kitty Styler restarts after installing starship.
 PENDING_IMPORT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "kitty-styler-import")
 
 
-def make_share_code(settings):
-    """The settings as a share code. The base theme travels as None: its label differs per PC."""
-    data = dict(settings)
+def color_snapshot(conf):
+    """The colour lines of a kitty theme, as {key: value}; anything else is left out."""
+    if not isinstance(conf, dict):
+        return {}
+    return {k: v for k, v in conf.items()
+            if isinstance(k, str) and isinstance(v, str) and SHARE_COLOR_KEY.fullmatch(k) and SHARE_COLOR.fullmatch(v)}
+
+
+def strip_styler_starship(text):
+    """starship.toml without Kitty Styler's prompt and palette blocks, for a share code."""
+    out, block = [], None
+    for line in strip_prompt_block(text).splitlines():
+        if line == STARSHIP_BEGIN:
+            block = True
+        elif block:
+            block = line != STARSHIP_END
+        elif line.strip() != STARSHIP_PALETTE_LINE:
+            out.append(line)
+    return "\n".join(out).strip() + "\n" if any(ln.strip() for ln in out) else ""
+
+
+def starship_runs(config):
+    """Dotted names of the starship.toml options that would run a program."""
+    found = [f"custom.{name}" for name in config.get("custom", {})] if isinstance(config.get("custom"), dict) else \
+        (["custom"] if "custom" in config else [])
+
+    def walk(table, path):
+        for key, value in table.items():
+            if path and (key in STARSHIP_RUNS or key.endswith("_binary")):
+                found.append(".".join((*path, key)))
+            elif isinstance(value, dict):
+                walk(value, (*path, key))
+    walk({k: v for k, v in config.items() if k != "custom"}, ())
+    return found
+
+
+def drop_options(config, dotted):
+    """A copy of a parsed TOML table without the given dotted option names."""
+    out = {}
+    for key, value in config.items():
+        if key in dotted:
+            continue
+        inner = [d[len(key) + 1:] for d in dotted if d.startswith(key + ".")]
+        if isinstance(value, dict) and inner:
+            value = drop_options(value, inner)
+            if not value:
+                continue  # a table that only held dropped options, like [custom]
+        out[key] = value
+    return out
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key, ensure_ascii=False)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{toml_key(k)} = {toml_value(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)  # JSON string escapes are valid TOML ones
+    return str(value)  # dates and times
+
+
+def toml_dump(table, path=()):
+    """TOML text for a parsed table (comments are gone; tomllib keeps none)."""
+    lines = [f"{toml_key(k)} = {toml_value(v)}" for k, v in table.items() if not isinstance(v, dict)]
+    for key, value in table.items():
+        if isinstance(value, dict):
+            name = (*path, key)
+            lines += ["", "[" + ".".join(toml_key(n) for n in name) + "]", *toml_dump(value, name)]
+    return lines
+
+
+def make_share_code(settings, colors=None, starship=None):
+    """The settings as a share code, with the theme's colours and the starship.toml the prompt
+    uses, so the result looks the same on the other PC. The base theme travels as None: its label
+    differs per PC."""
+    data = {k: v for k, v in settings.items() if k != "shared_starship"}
     if data.get("theme") == BASE_LABEL:
         data["theme"] = None
-    blob = json.dumps({"settings": data, "noctalia": NOCTALIA}, separators=(",", ":")).encode()
+    payload = {"settings": data, "noctalia": NOCTALIA, "colors": colors or {}}
+    if starship:
+        payload["starship"] = starship
+    blob = json.dumps(payload, separators=(",", ":")).encode()
     # zlib output starts with 0x78, so no leading zero bytes get lost in the number.
     n, digits = int.from_bytes(zlib.compress(blob, 9), "big"), []
     while n:
@@ -3041,6 +3289,14 @@ def apply_all(s, themes, colors, file_conf, reload=True):
     if any(picked) and not SLANGC:
         msg.append(SLANG_NOTE + " Until it is installed they do nothing.")
     mode = s.get("prompt_mode")
+    if s.get("shared_starship") and mode in ("starship", "styled"):
+        # From a share code. Written before the prompt and palette blocks, which go on top of it.
+        backup = None
+        if os.path.exists(STARSHIP_CONF):
+            backup = f"{STARSHIP_CONF}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(STARSHIP_CONF, backup)
+        write_atomic(STARSHIP_CONF, s["shared_starship"])
+        msg.append("starship.toml replaced with the shared one." + (f" Backup: {backup}" if backup else ""))
     if STARSHIP_AVAILABLE and mode:
         msg.append(apply_prompt(s if mode == "styled" else None))
     if KITTY_SHELL and mode:
@@ -3586,7 +3842,7 @@ def try_paths(tmp):
             "KITTY_STYLER_BASHRC": os.path.join(tmp, ".bashrc")}
 
 
-def try_in_kitty(settings, colors):
+def try_in_kitty(settings, colors, themes=None):
     """Open a kitty window with the settings as Apply would write them, without touching the real files.
 
     Copies the config files to a temp directory, runs Apply there in a child process (the paths come
@@ -3615,7 +3871,7 @@ def try_in_kitty(settings, colors):
             if os.path.exists(real):
                 os.symlink(real, os.path.join(zdot, name))
         with open(os.path.join(tmp, "try.json"), "w", encoding="utf-8") as f:
-            json.dump({"settings": settings, "colors": colors}, f)
+            json.dump({"settings": settings, "colors": colors, "themes": themes or {}}, f)
         env = dict(os.environ, KITTY_STYLER_SHELL=KITTY_SHELL or "", **paths)
         r = subprocess.run([sys.executable, os.path.realpath(__file__), "--try", tmp], env=env,
                            capture_output=True, text=True, timeout=60, check=False)
@@ -3656,7 +3912,9 @@ def try_apply(tmp):
             return 2
     with open(os.path.join(tmp, "try.json"), encoding="utf-8") as f:
         data = json.load(f)
-    apply_all(data["settings"], load_themes(), data["colors"], parse_conf_file(CONF), reload=False)
+    themes = load_themes()
+    themes.update(data.get("themes", {}))
+    apply_all(data["settings"], themes, data["colors"], parse_conf_file(CONF), reload=False)
     return 0
 
 
