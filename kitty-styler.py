@@ -1255,7 +1255,7 @@ class Preview(Gtk.DrawingArea):
             else:
                 cr.rectangle(*self.cursor_rect(*unfocused["\0cursor"], shape))
                 cr.fill()
-        # Where the focused cursor can be: after the command, or at its start while the trail demo runs.
+        # Where the focused cursor can be: after the command, or top left while the trail demo runs.
         self.cursor_spots = {k: self.cursor_rect(x, y, s["cursor_shape"]) for k, (x, y) in spots.items()}
         rect = self.cursor_spots.get(self.cursor_at) or self.cursor_spots.get("\0cursor")
         if rect:
@@ -1325,6 +1325,8 @@ class Preview(Gtk.DrawingArea):
         # Like a terminal, the newest lines stay and older ones scroll off the top.
         alpha = 1.0 if active else float(s["inactive_text_alpha"])
         spots = self.draw_lines(cr, layout, lines[-rows:] if rows else [], tx, ty, tx + tw, alpha)
+        # The trail demo's far spot: the top left cell, so the jump crosses the whole window.
+        spots["\0top"] = (tx, ty)
         cr.restore()
         return spots, (x, y, w, h)
 
@@ -1336,7 +1338,7 @@ class Preview(Gtk.DrawingArea):
             y = y0 + i * lh
             x = x0
             for j, (text, fg, bg, attrs) in enumerate(line):
-                if text in ("\0cursor", "\0home"):
+                if text == "\0cursor":
                     spots[text] = (x, y)
                     continue
                 if text.startswith("\0right"):
@@ -2146,7 +2148,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             ms = 500 if interval < 0 else int(interval * 1000)
             self.blink_id = GLib.timeout_add(ms, self.blink)
             self.blink_since = time.monotonic()
-        # With a cursor trail, the cursor jumps to the start of the command and back to show it.
+        # With a cursor trail, the cursor jumps to the top left corner and back to show it.
         trail = self.settings["cursor_trail"] != "0"
         if trail and not self.jump_id:
             self.jump_id = GLib.timeout_add(1500, self.jump)
@@ -2195,8 +2197,8 @@ class StylerWindow(Gtk.ApplicationWindow):
     def jump(self):
         pv = self.preview
         spots = pv.cursor_spots
-        new = "\0home" if pv.cursor_at == "\0cursor" else "\0cursor"
-        if "\0home" not in spots or "\0cursor" not in spots:
+        new = "\0top" if pv.cursor_at == "\0cursor" else "\0cursor"
+        if "\0top" not in spots or "\0cursor" not in spots:
             return True
         old_rect, new_rect = spots[pv.cursor_at], spots[new]
         pv.cursor_at = new
@@ -2285,8 +2287,7 @@ class StylerWindow(Gtk.ApplicationWindow):
 
         def command(cmd, cursor, ghost, comment, unknown):
             """What follows the prompt: the typed command, cursor, suggestion and a comment."""
-            out = [("\0home", fg, None, "")] if cursor else []
-            out += typed(cmd, unknown)
+            out = typed(cmd, unknown)
             if cursor:
                 out.append(("\0cursor", fg, None, ""))
             if ghost and self.zsh_info["suggest"]:
