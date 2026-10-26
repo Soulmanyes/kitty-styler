@@ -1143,6 +1143,442 @@ class KittyTerminal:
         subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
 
 
+TOML_HEADER = re.compile(r"^\s*(\[\[?)\s*([^\]]+?)\s*\]\]?\s*(#.*)?$")
+TOML_ASSIGN = re.compile(r"^(\s*)([A-Za-z0-9_.\-]+(?:\s*\.\s*[A-Za-z0-9_\-]+)*)(\s*=\s*)(.*)$")
+
+
+def toml_sections(lines):
+    """[(table path, first line, end)]: the top level, then one per [table] header. Arrays of tables
+    ([[x]]) get None, so nothing in them is edited."""
+    out, path, start = [], (), 0
+    for i, line in enumerate(lines):
+        m = TOML_HEADER.match(line)
+        if m:
+            out.append((path, start, i))
+            path = None if m.group(1) == "[[" else tuple(p.strip().strip('"') for p in m.group(2).split("."))
+            start = i + 1
+    out.append((path, start, len(lines)))
+    return out
+
+
+def toml_find(lines, path):
+    """(line, rest) where a value in path is set: rest is what is left of path inside an inline
+    table on that line. None if the file doesn't set it in a form this can edit."""
+    for table, start, end in toml_sections(lines):
+        if table is None or tuple(path[:len(table)]) != table or len(table) >= len(path):
+            continue
+        rest = tuple(path[len(table):])
+        for i in range(start, end):
+            m = TOML_ASSIGN.match(lines[i])
+            if m:
+                key = tuple(p.strip() for p in m.group(2).split("."))
+                if rest[:len(key)] == key:
+                    return i, rest[len(key):]
+    return None
+
+
+def toml_inline(value):
+    """A value as TOML on one line, inline tables written { like = "this" }."""
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_inline(v)}" for k, v in value.items()) + " }"
+    return toml_value(value)
+
+
+def toml_set(lines, path, value):
+    """Set path in place on the line that already sets it (also inside a one-line inline table).
+    Returns False, changing nothing, if the file sets it in a form this can't edit."""
+    found = toml_find(lines, path)
+    if not found:
+        return False
+    i, rest = found
+    m = TOML_ASSIGN.match(lines[i])
+    if rest:
+        try:
+            old = tomllib.loads("v = " + m.group(4))["v"]
+        except tomllib.TOMLDecodeError:
+            return False
+        node = old
+        for part in rest[:-1]:
+            if not isinstance(node, dict):
+                return False
+            node = node.setdefault(part, {})
+        if not isinstance(node, dict):
+            return False
+        node[rest[-1]] = value
+        value = old
+    else:
+        try:
+            tomllib.loads("v = " + m.group(4))
+        except tomllib.TOMLDecodeError:
+            return False  # a value over several lines
+    lines[i] = m.group(1) + m.group(2) + m.group(3) + toml_inline(value)
+    return True
+
+
+def deep_get(table, path, default=None):
+    for part in path:
+        if not isinstance(table, dict) or part not in table:
+            return default
+        table = table[part]
+    return table
+
+
+def deep_set(table, path, value):
+    for part in path[:-1]:
+        table = table.setdefault(part, {})
+    table[path[-1]] = value
+
+
+def deep_merge(base, extra):
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def toml_file(path):
+    try:
+        return tomllib.loads(read(path))
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
+def hex_color(value):
+    """#rrggbb for "#RRGGBB" or "0xRRGGBB"; None for anything else."""
+    m = re.fullmatch(r"(?:#|0x)([0-9a-fA-F]{6})", str(value).strip())
+    return "#" + m.group(1).lower() if m else None
+
+
+ANSI_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+ALACRITTY_COLORS = {"foreground": ("colors", "primary", "foreground"),
+                    "background": ("colors", "primary", "background"),
+                    "cursor": ("colors", "cursor", "cursor"), "cursor_text_color": ("colors", "cursor", "text"),
+                    "selection_foreground": ("colors", "selection", "text"),
+                    "selection_background": ("colors", "selection", "background"),
+                    **{f"color{i}": ("colors", "normal" if i < 8 else "bright", ANSI_NAMES[i % 8])
+                       for i in range(16)}}
+
+
+def seconds(value):
+    """A number of seconds as kitty writes it: 0.5, 1, 1.2."""
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+# kitty key -> (choices this terminal has, None for the app's own list; its default).
+ALACRITTY_OPTIONS = {
+    "font_size": (None, "11.25"), "bold_font": (None, "auto"), "italic_font": (None, "auto"),
+    "bold_italic_font": (None, "auto"), "background_opacity": (None, "1.00"),
+    "window_padding_width": (None, "0"), "hide_window_decorations": (["no", "yes"], "no"),
+    "cursor_shape": (None, "block"), "cursor_shape_unfocused": (["hollow", "unchanged"], "hollow"),
+    "cursor_blink_interval": (["0", "0.3", "0.5", "0.75", "1.2"], "0"),
+    "cursor_stop_blinking_after": (["0", "5", "15", "30", "60"], "5"),
+}
+ALACRITTY_FONTS = {"font_family": "normal", "bold_font": "bold", "italic_font": "italic",
+                   "bold_italic_font": "bold_italic"}
+
+
+class AlacrittyTerminal:
+    """Alacritty. Keys alacritty.toml sets itself are edited in place (the main file wins over its
+    imports); the rest go in kitty-styler.toml, imported last. A picked theme's colours go there too,
+    and while one is picked the [colors] tables of alacritty.toml wait in alacritty-colors.kitty-styler.toml,
+    imported before ours, so they don't win over it. Picking the base theme puts them back."""
+
+    name = "alacritty"
+    MANAGED = "kitty-styler.toml"
+    SIDE = "alacritty-colors.kitty-styler.toml"
+    NOCTALIA_IMPORT = "noctalia.toml"
+    THEME_LINE = "# Theme: "
+    IMPORT_LINE = "# kitty-styler original import: "
+    ANCHOR_LINE = "# kitty-styler put back before: "
+
+    def __init__(self, conf=None):
+        self.conf = conf or self.find_conf()
+        self.dir = os.path.dirname(self.conf)
+        self.managed = os.path.join(self.dir, self.MANAGED)
+        self.side = os.path.join(self.dir, self.SIDE)
+        self.noctalia_theme = os.path.join(self.dir, "themes", self.NOCTALIA_IMPORT)
+
+    @staticmethod
+    def find_conf():
+        """The file alacritty loads: the first that exists, in alacritty's order (else the first)."""
+        if os.environ.get("KITTY_STYLER_ALACRITTY"):
+            return os.environ["KITTY_STYLER_ALACRITTY"]
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        candidates = [os.path.join(xdg, "alacritty", "alacritty.toml"), os.path.join(xdg, "alacritty.toml"),
+                      os.path.expanduser("~/.config/alacritty/alacritty.toml"),
+                      os.path.expanduser("~/.alacritty.toml")]
+        return next((c for c in candidates if os.path.isfile(c)), candidates[0])
+
+    def import_path(self, path):
+        """The path as it stands in an import list: relative to the config folder where it can be."""
+        rel = os.path.relpath(path, self.dir)
+        return rel if not rel.startswith("..") else path
+
+    def resolve(self, entry):
+        entry = os.path.expanduser(entry)
+        return os.path.normpath(entry if os.path.isabs(entry) else os.path.join(self.dir, entry))
+
+    def imports(self, data):
+        value = deep_get(data, ("general", "import"), data.get("import", []))
+        return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+    def merged(self, skip=(), path=None, depth=0):
+        """The config as alacritty sees it: imports in order, then the file itself."""
+        path = path or self.conf
+        data = toml_file(path)
+        out = {}
+        for entry in self.imports(data):
+            target = self.resolve(entry)
+            if target not in skip and os.path.isfile(target) and depth < 5:
+                deep_merge(out, self.merged(skip, target, depth + 1))
+        return deep_merge(out, data)
+
+    @property
+    def noctalia(self):
+        imports = self.imports(toml_file(self.conf))
+        on = any(entry.endswith(self.NOCTALIA_IMPORT) for entry in imports) and os.path.exists(self.noctalia_theme)
+        # The main file's own colours win over Noctalia's, unless they are parked in the side file.
+        own = deep_get(toml_file(self.conf), ("colors",)) and not os.path.exists(self.side)
+        return bool(on and not own and '"alacritty"' in read(NOCTALIA_SETTINGS))
+
+    def to_kitty(self, data):
+        """kitty option names for what data sets, with alacritty's defaults for the rest."""
+        out = {key: default for key, (_choices, default) in ALACRITTY_OPTIONS.items()}
+        fonts = {k: deep_get(data, ("font", sub, "family")) for k, sub in ALACRITTY_FONTS.items()}
+        out["font_family"] = fonts.pop("font_family") or "monospace"
+        for key, family in fonts.items():
+            out[key] = family if family and family != out["font_family"] else "auto"
+        if isinstance(deep_get(data, ("font", "size")), (int, float)):
+            size = deep_get(data, ("font", "size"))
+            out["font_size"] = f"{size:.1f}" if round(size, 1) == size else seconds(size)
+        if isinstance(deep_get(data, ("window", "opacity")), (int, float)):
+            out["background_opacity"] = f"{deep_get(data, ('window', 'opacity')):.2f}"
+        if isinstance(deep_get(data, ("window", "padding", "x")), int):
+            out["window_padding_width"] = str(deep_get(data, ("window", "padding", "x")))
+        out["hide_window_decorations"] = "yes" if deep_get(data, ("window", "decorations")) == "None" else "no"
+        style = deep_get(data, ("cursor", "style"))
+        shape = style if isinstance(style, str) else deep_get(style, ("shape",), "Block")
+        blinking = deep_get(style, ("blinking",), "Off") if isinstance(style, dict) else "Off"
+        out["cursor_shape"] = str(shape).lower()
+        out["cursor_shape_unfocused"] = "hollow" if deep_get(data, ("cursor", "unfocused_hollow"), True) else "unchanged"
+        if blinking in ("On", "Always"):
+            out["cursor_blink_interval"] = seconds(deep_get(data, ("cursor", "blink_interval"), 750) / 1000)
+        if isinstance(deep_get(data, ("cursor", "blink_timeout")), int):
+            out["cursor_stop_blinking_after"] = str(deep_get(data, ("cursor", "blink_timeout")))
+        shell = deep_get(data, ("terminal", "shell"))
+        shell = deep_get(shell, ("program",)) if isinstance(shell, dict) else shell
+        if isinstance(shell, str):
+            out["shell"] = shell
+        for key, path in ALACRITTY_COLORS.items():
+            color = hex_color(deep_get(data, path, ""))
+            if color:
+                out[key] = color
+        return out
+
+    def to_alacritty(self, s):
+        """{kitty key: {path: value}}: the alacritty settings each of the app's settings stands for."""
+        out = {key: {("font", sub, "family"): s["font_family"] if s[key] == "auto" else s[key]}
+               for key, sub in ALACRITTY_FONTS.items()}
+        out["font_size"] = {("font", "size"): float(s["font_size"])}
+        out["background_opacity"] = {("window", "opacity"): float(s["background_opacity"])}
+        pad = int(float(s["window_padding_width"]))
+        out["window_padding_width"] = {("window", "padding"): {"x": pad, "y": pad}}
+        out["hide_window_decorations"] = {
+            ("window", "decorations"): "None" if s["hide_window_decorations"] == "yes" else "Full"}
+        out["cursor_shape"] = {("cursor", "style", "shape"): s["cursor_shape"].capitalize()}
+        blink = float(s["cursor_blink_interval"])
+        out["cursor_blink_interval"] = {("cursor", "style", "blinking"): "On" if blink > 0 else "Off"}
+        if blink > 0:
+            out["cursor_blink_interval"][("cursor", "blink_interval")] = round(blink * 1000)
+        out["cursor_shape_unfocused"] = {("cursor", "unfocused_hollow"): s["cursor_shape_unfocused"] == "hollow"}
+        out["cursor_stop_blinking_after"] = {
+            ("cursor", "blink_timeout"): int(float(s["cursor_stop_blinking_after"]))}
+        return out
+
+    def read_conf(self, without_theme=False):
+        return self.to_kitty(self.merged(skip={self.managed} if without_theme else ()))
+
+    def theme(self):
+        text = read(self.managed)
+        first = text.split("\n", 1)[0]
+        if not first.startswith(self.THEME_LINE):
+            return None, ""
+        colors = self.to_kitty(toml_file(self.managed))
+        return first[len(self.THEME_LINE):].strip(), "".join(
+            f"{k} {colors[k]}\n" for k in ALACRITTY_COLORS if k in colors)
+
+    def noctalia_colors(self):
+        return {k: v for k, v in self.to_kitty(toml_file(self.noctalia_theme)).items() if k in ALACRITTY_COLORS}
+
+    def shell(self):
+        return kitty_shell(self.read_conf())
+
+    def move_colors_out(self, lines):
+        """Cut the [colors] tables out of lines; returns the side file text, or None if there are none."""
+        sections = toml_sections(lines)
+        chunks, keep = [], []
+        for n, (table, start, end) in enumerate(sections):
+            first = start - 1 if table != () else start  # the header line
+            if table and table[0] == "colors":
+                anchor = next((lines[s - 1] for t, s, _e in sections[n + 1:]
+                               if not (t and t[0] == "colors")), "")
+                if chunks and chunks[-1][0] == anchor:
+                    chunks[-1][1].extend(lines[first:end])
+                else:
+                    chunks.append((anchor, lines[first:end]))
+            else:
+                keep.extend(lines[first:end])
+        if not chunks:
+            return None
+        lines[:] = keep
+        out = ["# Kitty Styler moved these from alacritty.toml while a theme is picked, so the theme",
+               "# can win over them. Picking the base theme puts them back."]
+        for anchor, chunk in chunks:
+            out += [self.ANCHOR_LINE + anchor, *chunk]
+        return "\n".join(out) + "\n"
+
+    def move_colors_back(self, lines):
+        chunks, cur = [], None
+        for line in read(self.side).splitlines():
+            if line.startswith(self.ANCHOR_LINE):
+                cur = (line[len(self.ANCHOR_LINE):], [])
+                chunks.append(cur)
+            elif cur:
+                cur[1].append(line)
+        for anchor, chunk in chunks:
+            at = next((i for i, line in enumerate(lines) if anchor and line == anchor), len(lines))
+            lines[at:at] = chunk
+
+    def set_imports(self, lines, wanted_ours):
+        """Rewrite [general] import so our files come last (side file, then ours). The original import
+        text is kept in kitty-styler.toml and put back once neither file is imported any more."""
+        ours = {self.import_path(self.side), self.import_path(self.managed)}
+        current = self.imports(tomllib.loads("\n".join(lines)))
+        others = [e for e in current if e not in ours]
+        if current == others + wanted_ours:
+            return None
+        found = toml_find(lines, ("general", "import")) or toml_find(lines, ("import",))
+        start = found[0] if found else None
+        end = start
+        if start is not None:
+            depth = 0
+            for end in range(start, len(lines)):
+                depth += lines[end].count("[") - lines[end].count("]")
+                if depth <= 0:
+                    break
+        original = lines[start:end + 1] if start is not None else []
+        saved = None
+        for line in read(self.managed).splitlines():
+            if line.startswith(self.IMPORT_LINE):
+                saved = json.loads(line[len(self.IMPORT_LINE):])
+        if not wanted_ours and saved is not None:
+            new = saved["lines"] if saved["imports"] == others else (
+                ["import = ["] + [f"    {toml_value(e)}," for e in others] + ["]"] if others else [])
+            if start is None:
+                return saved
+            lines[start:end + 1] = new
+            if saved["added_general"] and not new:
+                i = next((i for i, line in enumerate(lines) if line.strip() == "[general]"), None)
+                if i is not None and (i + 1 == len(lines) or TOML_HEADER.match(lines[i + 1]) or not lines[i + 1].strip()):
+                    del lines[i:i + 2 if i + 1 < len(lines) and not lines[i + 1].strip() else i + 1]
+            return saved
+        # One path per line: Noctalia's undo deletes every line naming noctalia.toml.
+        new = ["import = ["] + [f"    {toml_value(e)}," for e in others + wanted_ours] + ["]"]
+        saved = saved or {"lines": original, "imports": others, "added_general": False}
+        if start is not None:
+            lines[start:end + 1] = new
+        elif any(line.strip() == "[general]" for line in lines):
+            i = next(i for i, line in enumerate(lines) if line.strip() == "[general]")
+            lines[i + 1:i + 1] = new
+        else:
+            lines[0:0] = ["[general]", *new, ""]
+            saved["added_general"] = True
+        return saved
+
+    def write(self, s, themes, file_conf):
+        text = read(self.conf)
+        lines = text.splitlines()
+        before = tomllib.loads(text) if text else {}
+        old_managed = toml_file(self.managed)
+        # Decide per setting, not per alacritty value: the mapping loses detail (padding x and y,
+        # blinking "Never" or "Always"), so a setting left alone must not touch the file.
+        changed = {key for key in ALACRITTY_FONTS | ALACRITTY_OPTIONS
+                   if not same(str(s[key]), str(file_conf.get(key, "")))}
+        if "font_family" in changed:
+            changed |= {key for key in ALACRITTY_FONTS if s[key] == "auto"}
+        wanted, managed, notes = {}, {}, []
+        for key, paths in self.to_alacritty(s).items():
+            for path, value in paths.items():
+                if deep_get(before, path) is not None:
+                    if key in changed and deep_get(before, path) != value:
+                        if toml_set(lines, path, value):
+                            wanted[path] = value
+                        else:
+                            notes.append(f"Could not change {'.'.join(path)} in {os.path.basename(self.conf)}; "
+                                         "it is set there in a form Kitty Styler can't edit.")
+                elif key in changed or deep_get(old_managed, path) is not None:
+                    deep_set(managed, path, value)
+        theme = s["theme"] if s["theme"] != BASE_LABEL else None
+        side_text = None
+        if theme:
+            colors = parse_conf(themes[theme])
+            for key, path in ALACRITTY_COLORS.items():
+                if hex_color(colors.get(key, "")):
+                    deep_set(managed, path, hex_color(colors[key]))
+            if not os.path.exists(self.side):
+                side_text = self.move_colors_out(lines)
+        elif os.path.exists(self.side):
+            self.move_colors_back(lines)
+        side_on = bool(side_text) or (theme and os.path.exists(self.side))
+        wanted_ours = ([self.import_path(self.side)] if side_on else []) + \
+                      ([self.import_path(self.managed)] if managed or theme else [])
+        saved = self.set_imports(lines, wanted_ours)
+        new_text = "\n".join(lines) + ("\n" if lines else "")
+        try:
+            after = tomllib.loads(new_text)
+        except tomllib.TOMLDecodeError as e:
+            raise OSError(f"left {self.conf} alone: the edit would break it ({e})") from e
+        # The edited values read back, and everything else in the file reads back as before.
+        def rest(data):
+            data = json.loads(json.dumps(data, default=str))
+            for path in (*wanted, ("colors",), ("general", "import"), ("import",)):
+                node = deep_get(data, path[:-1])
+                if isinstance(node, dict):
+                    node.pop(path[-1], None)
+            if data.get("general") == {}:
+                del data["general"]  # added to hold the import
+            return data
+        if any(deep_get(after, path) != value for path, value in wanted.items()) or rest(before) != rest(after):
+            raise OSError(f"left {self.conf} alone: the edit did not come out as planned")
+
+        backup = None
+        if text and new_text != text:
+            backup = f"{self.conf}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(self.conf, backup)
+            prune_backups(self.conf)
+        if side_text:
+            write_atomic(self.side, side_text)
+        if wanted_ours:
+            head = ([self.THEME_LINE + theme] if theme else []) + \
+                   ["# Written by kitty-styler, imported last from alacritty.toml. Changes here are overwritten."]
+            if saved:
+                head.append(self.IMPORT_LINE + json.dumps(saved))
+            write_atomic(self.managed, "\n".join(head + toml_dump(managed)) + "\n")
+        if new_text != text:
+            write_atomic(self.conf, new_text)
+        if not side_on and os.path.exists(self.side):
+            os.remove(self.side)
+        if not wanted_ours and os.path.exists(self.managed):
+            os.remove(self.managed)
+        self.notes = notes
+        return backup
+
+    def reload(self):
+        # live_config_reload (on unless turned off) picks the change up.
+        pass
+
+
 TERMINAL = KittyTerminal()
 KITTY_SHELL = TERMINAL.shell()
 # The Shell (zsh) section edits .zshrc, which only matters when kitty runs zsh.
@@ -3299,9 +3735,9 @@ def read_share_code(text):
     return data
 
 
-def prune_backups():
-    """Delete all but the newest KEEP_BACKUPS kitty.conf.bak-<time> files; other files are left alone."""
-    folder, name = os.path.split(CONF)
+def prune_backups(conf=CONF):
+    """Delete all but the newest KEEP_BACKUPS <conf>.bak-<time> files; other files are left alone."""
+    folder, name = os.path.split(conf)
     pattern = re.compile(re.escape(name) + r"\.bak-\d{8}-\d{6}$")
     for old in sorted(f for f in os.listdir(folder) if pattern.match(f))[:-KEEP_BACKUPS]:
         os.remove(os.path.join(folder, old))
