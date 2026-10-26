@@ -1433,7 +1433,8 @@ class AlacrittyTerminal:
         return out
 
     def read_conf(self, without_theme=False):
-        return self.to_kitty(self.merged(skip={self.managed} if without_theme else ()))
+        return {**TERMINAL_DEFAULT_COLORS["alacritty"],
+                **self.to_kitty(self.merged(skip={self.managed} if without_theme else ()))}
 
     def theme(self):
         text = read(self.managed)
@@ -1783,7 +1784,8 @@ class FootTerminal:
         return out
 
     def read_conf(self, without_theme=False):
-        return self.to_kitty(self.parse(self.conf, skip={os.path.realpath(self.theme_file)} if without_theme else ()))
+        return {**TERMINAL_DEFAULT_COLORS["foot"], **self.to_kitty(
+            self.parse(self.conf, skip={os.path.realpath(self.theme_file)} if without_theme else ()))}
 
     def theme(self):
         text = read(self.theme_file)
@@ -2073,7 +2075,8 @@ class GhosttyTerminal:
         return out
 
     def read_conf(self, without_theme=False):
-        return self.to_kitty(self.parse(self.conf, skip={os.path.realpath(self.managed)} if without_theme else ()))
+        return {**TERMINAL_DEFAULT_COLORS["ghostty"], **self.to_kitty(
+            self.parse(self.conf, skip={os.path.realpath(self.managed)} if without_theme else ()))}
 
     def theme(self):
         first = read(self.managed).split("\n", 1)[0]
@@ -2187,6 +2190,24 @@ class GhosttyTerminal:
                             "[]", "{}"], check=False, **quiet)
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+
+def default_colors(fg, bg, palette):
+    """Kitty colour keys for a terminal's built-in colours (from its documentation). Cursor and selection
+    default to the inverse of the text in all three."""
+    return {"foreground": fg, "background": bg, "cursor": fg, "cursor_text_color": bg,
+            "selection_foreground": bg, "selection_background": fg,
+            **{f"color{i}": c for i, c in enumerate(palette.split())}}
+
+
+TERMINAL_DEFAULT_COLORS = {
+    "alacritty": default_colors("#d8d8d8", "#181818", "#181818 #ac4242 #90a959 #f4bf75 #6a9fb5 #aa759f #75b5aa "
+                                "#d8d8d8 #6b6b6b #c55555 #aac474 #feca88 #82b8c8 #c28cb8 #93d3c3 #f8f8f8"),
+    "foot": default_colors("#ffffff", "#242424", "#242424 #f62b5a #47b413 #e3c401 #24acd4 #f2affd #13c299 "
+                           "#e6e6e6 #616161 #ff4d51 #35d450 #e9e836 #5dc5f8 #feabf2 #24dfc4 #ffffff"),
+    "ghostty": default_colors("#ffffff", "#282c34", "#1d1f21 #cc6666 #b5bd68 #f0c674 #81a2be #b294bb #8abeb7 "
+                              "#c5c8c6 #666666 #d54e53 #b9ca4a #e7c547 #7aa6da #c397d8 #70c0b1 #eaeaea"),
+}
 
 
 # Settings that belong to the terminal (the rest are the prompt's and the shell's).
