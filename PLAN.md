@@ -1,4 +1,4 @@
-# Plan: other terminals (Alacritty, foot, Ghostty)
+# Plan: other terminals (Alacritty, foot, Ghostty), and the rename to Shellac
 
 Goal: Kitty Styler also styles Alacritty, foot and Ghostty. Kitty keeps working exactly as now.
 The prompt, starship and zsh parts already work in any terminal and stay as they are.
@@ -64,3 +64,4 @@ Testing: only scratch copies (`KITTY_STYLER_*` env), harness refuses paths outsi
 - Next (phase 6): GUI pass with all four terminals, README (terminal list, what each supports), screenshots, licence check, release. Try-in-terminal for the others is optional.
 - Reload for Ghostty follows Noctalia's hook: systemd MainPID + reload, D-Bus primary `reload-config`, then SIGUSR2 to other processes whose argv0 is ghostty (matched by /proc cmdline, never pgrep -f: that matched the test shell itself). Checked on a gtk-single-instance=false window. Try in kitty: child pinned to `KITTY_STYLER_TERMINAL=kitty`, `try_apply` refuses another terminal. Kitty rows/dropdowns compared with main: identical apart from the Terminal row.
 - Ghostty note for README: creating config.ghostty gives Noctalia's ghostty hook a file to add `theme = noctalia` to.
+- Rename (owner, 2026-10-26): the app is now **Shellac** (`shellac.py`, app id `io.github.soulmanyes.Shellac`, `~/.local/share/shellac`, `~/.config/shellac` with a one-time move from `~/.config/kitty-styler` at program start). Kept for existing setups: `BEGIN_KITTY_STYLER`/starship/zsh markers, kitty's `themes/kitty-styler.conf`, `.bak-kitty-styler` backups, `KITTY_STYLER_*` env vars, `ks2:` codes, extras in `~/.local/share/kitty-styler/extras`. New terminals' files are `shellac.*`. install.sh moves an old install over: the old `kitty-styler.py` becomes a stub that starts Shellac (an open 1.3.x restarts through it after updating), old menu entries go, `kitty-styler` command points at Shellac. At release: rename the GitHub repo to Soulmanyes/shellac, then set `REPO` and the install.sh/README URLs to it.

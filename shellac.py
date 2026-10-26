@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kitty Styler: pick kitty's look from dropdowns and see it live before applying."""
+"""Shellac: style your terminal (kitty, Alacritty, foot, Ghostty) and shell prompt with a live preview."""
 import base64
 import glob
 import json
@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore", ".*cairo_set_source_pixbuf", DeprecationWarnin
 from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo
 
 # updater.py sits next to this file (the command in ~/.local/bin is a symlink). A copy of
-# kitty-styler.py on its own still runs, just without the Updates section.
+# shellac.py on its own still runs, just without the Updates section.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     import updater
@@ -71,11 +71,11 @@ BLOCK_END = "# END_KITTY_STYLER"
 # theme entry keeps whatever colours kitty.conf already has.
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
-APP_ID = "io.github.soulmanyes.KittyStyler"
+APP_ID = "io.github.soulmanyes.Shellac"
 VERSION = "1.3.1"
 REPO = "Soulmanyes/kitty-styler"
-UPDATE_STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-                            "kitty-styler", "updates.json")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+UPDATE_STATE = os.path.join(CONFIG_HOME, "shellac", "updates.json")
 
 KITTY_COLORS = {
     "foreground": "#dddddd", "background": "#000000",
@@ -393,7 +393,7 @@ PROMPT_OPTIONS = [
     ("Time colour", "p_time_color", *COLORS[:1], "cyan", PROMPT_COLORS),
 ]
 PROMPT_KEYS = [o for o in PROMPT_OPTIONS if o[1]]
-# Shell (zsh). Kitty Styler owns two blocks in .zshrc: the plugin list just before the line that
+# Shell (zsh). Shellac owns two blocks in .zshrc: the plugin list just before the line that
 # loads oh-my-zsh, and everything else at the end, after zsh-syntax-highlighting has loaded.
 ZSHRC = os.path.expanduser(os.environ.get("KITTY_STYLER_ZSHRC",
                                           os.path.join(os.environ.get("ZDOTDIR", "~"), ".zshrc")))
@@ -672,13 +672,13 @@ SHELL_RC_NAMES = {"zsh": ".zshrc", "fish": "config.fish", "bash": ".bashrc"}
 NOT_FOUND = {"zsh": "zsh: command not found: sl", "fish": "fish: Unknown command: sl",
              "bash": "bash: sl: command not found"}
 STARSHIP_BIN = find_extra("starship")
-# Lines Kitty Styler adds to the shell config so starship takes over the prompt. They are skipped
+# Lines Shellac adds to the shell config so starship takes over the prompt. They are skipped
 # when KITTY_STYLER_BASE_PROMPT is set, which is how the preview draws the shell's own prompt.
 SWITCH_TOP_BEGIN = "# >>> KITTY STYLER PROMPT SETUP >>>"
 SWITCH_TOP_END = "# <<< KITTY STYLER PROMPT SETUP <<<"
 SWITCH_BEGIN = "# >>> KITTY STYLER PROMPT SWITCH >>>"
 SWITCH_END = "# <<< KITTY STYLER PROMPT SWITCH <<<"
-SWITCH_NOTE = "# Managed by Kitty Styler: the prompt comes from starship. Pick your own prompt there to undo."
+SWITCH_NOTE = "# Managed by Shellac: the prompt comes from starship. Pick your own prompt there to undo."
 SWITCH_LINES = {
     # Before anything else, so Powerlevel10k's instant prompt (CachyOS loads it first thing) stays off.
     "zsh_top": ["if [[ -z $KITTY_STYLER_BASE_PROMPT ]]; then",
@@ -915,7 +915,7 @@ def render_env(**extra):
 
 
 def render_shell_prompt(shell):
-    """The shell's own prompt (without Kitty Styler's starship switch): (engine name,
+    """The shell's own prompt (without Shellac's starship switch): (engine name,
     {status: (left rows, right runs)}), or None when it could not be read."""
     out = run_quiet([shell, *SHELL_FLAGS[shell]], render_env(KITTY_STYLER_BASE_PROMPT="1"),
                     RENDER_SCRIPTS[shell])
@@ -932,7 +932,7 @@ def render_starship(config_text):
     """starship's prompt for this config: ("Starship", {status: (left rows, right runs)}), or None."""
     if not STARSHIP_BIN:
         return None
-    fd, path = tempfile.mkstemp(prefix="kitty-styler-", suffix=".toml", dir=os.environ.get("XDG_RUNTIME_DIR"))
+    fd, path = tempfile.mkstemp(prefix="shellac-", suffix=".toml", dir=os.environ.get("XDG_RUNTIME_DIR"))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(config_text)
@@ -1147,7 +1147,7 @@ class KittyTerminal:
         if s["theme"] != BASE_LABEL:
             os.makedirs(os.path.dirname(STYLER_THEME), exist_ok=True)
             with open(STYLER_THEME, "w", encoding="utf-8") as f:
-                f.write(f"# Theme: {s['theme']}\n# Written by kitty-styler from kitty's theme collection.\n")
+                f.write(f"# Theme: {s['theme']}\n# Written by Shellac from kitty's theme collection.\n")
                 f.write(themes[s["theme"]])
             extra.append(STYLER_INCLUDE)
         if extra:
@@ -1314,8 +1314,8 @@ ALACRITTY_FONTS = {"font_family": "normal", "bold_font": "bold", "italic_font": 
 
 class AlacrittyTerminal:
     """Alacritty. Keys alacritty.toml sets itself are edited in place (the main file wins over its
-    imports); the rest go in kitty-styler.toml, imported last. A picked theme's colours go there too,
-    and while one is picked the [colors] tables of alacritty.toml wait in alacritty-colors.kitty-styler.toml,
+    imports); the rest go in shellac.toml, imported last. A picked theme's colours go there too,
+    and while one is picked the [colors] tables of alacritty.toml wait in alacritty-colors.shellac.toml,
     imported before ours, so they don't win over it. Picking the base theme puts them back."""
 
     name = "alacritty"
@@ -1334,12 +1334,12 @@ class AlacrittyTerminal:
         return (f"Apply saves this theme in {self.MANAGED}, which alacritty.toml imports. While a theme is "
                 f"picked, the [colors] tables of alacritty.toml wait in {self.SIDE}; picking "
                 f'"{BASE_LABEL}" puts them back.')
-    MANAGED = "kitty-styler.toml"
-    SIDE = "alacritty-colors.kitty-styler.toml"
+    MANAGED = "shellac.toml"
+    SIDE = "alacritty-colors.shellac.toml"
     NOCTALIA_IMPORT = "noctalia.toml"
     THEME_LINE = "# Theme: "
-    IMPORT_LINE = "# kitty-styler original import: "
-    ANCHOR_LINE = "# kitty-styler put back before: "
+    IMPORT_LINE = "# Shellac original import: "
+    ANCHOR_LINE = "# Shellac puts this back before: "
 
     def __init__(self, conf=None):
         self.conf = conf or self.find_conf()
@@ -1482,7 +1482,7 @@ class AlacrittyTerminal:
         if not chunks:
             return None
         lines[:] = keep
-        out = ["# Kitty Styler moved these from alacritty.toml while a theme is picked, so the theme",
+        out = ["# Shellac moved these from alacritty.toml while a theme is picked, so the theme",
                "# can win over them. Picking the base theme puts them back."]
         for anchor, chunk in chunks:
             out += [self.ANCHOR_LINE + anchor, *chunk]
@@ -1502,7 +1502,7 @@ class AlacrittyTerminal:
 
     def set_imports(self, lines, wanted_ours):
         """Rewrite [general] import so our files come last (side file, then ours). The original import
-        text is kept in kitty-styler.toml and put back once neither file is imported any more."""
+        text is kept in shellac.toml and put back once neither file is imported any more."""
         ours = {self.import_path(self.side), self.import_path(self.managed)}
         current = self.imports(tomllib.loads("\n".join(lines)))
         others = [e for e in current if e not in ours]
@@ -1570,7 +1570,7 @@ class AlacrittyTerminal:
                             wanted[path] = value
                         else:
                             notes.append(f"Could not change {'.'.join(path)} in {os.path.basename(self.conf)}; "
-                                         "it is set there in a form Kitty Styler can't edit.")
+                                         "it is set there in a form Shellac can't edit.")
                 elif key in changed or deep_get(old_managed, path) is not None:
                     deep_set(managed, path, value)
         theme = s["theme"] if s["theme"] != BASE_LABEL else None
@@ -1615,7 +1615,7 @@ class AlacrittyTerminal:
             write_atomic(self.side, side_text)
         if wanted_ours:
             head = ([self.THEME_LINE + theme] if theme else []) + \
-                   ["# Written by kitty-styler, imported last from alacritty.toml. Changes here are overwritten."]
+                   ["# Written by Shellac, imported last from alacritty.toml. Changes here are overwritten."]
             if saved:
                 head.append(self.IMPORT_LINE + json.dumps(saved))
             write_atomic(self.managed, "\n".join(head + toml_dump(managed)) + "\n")
@@ -1671,7 +1671,7 @@ class FootTerminal:
     live_reload = False
     kitty_only = False
     neutral = NO_KITTY_EXTRAS
-    THEME_FILE = "kitty-styler.ini"
+    THEME_FILE = "shellac.ini"
     BEGIN = "# BEGIN_KITTY_STYLER (managed by kitty-styler; keep this block last so it wins)"
     END = "# END_KITTY_STYLER"
 
@@ -1888,7 +1888,7 @@ class FootTerminal:
                 text_color = hex_color(colors.get("cursor_text_color", "")) or hex_color(colors.get("background", ""))
                 if text_color:
                     entries.append(f"cursor={text_color[1:]} {hex_color(colors['cursor'])[1:]}")
-            theme_text = "\n".join([f"# Theme: {theme}", "# Written by kitty-styler from kitty's theme collection.",
+            theme_text = "\n".join([f"# Theme: {theme}", "# Written by Shellac from kitty's theme collection.",
                                     "[colors-dark]", *entries]) + "\n"
         if shutil.which("foot"):
             # foot checks the whole config, includes too; nothing is written if it says no.
@@ -1954,7 +1954,7 @@ def ghostty_line(line):
 
 class GhosttyTerminal:
     """Ghostty. Keys its config sets itself are edited in place; the rest, and a picked theme's colours,
-    go in kitty-styler.ghostty, loaded with config-file. Ghostty loads config-file files after the
+    go in shellac.ghostty, loaded with config-file. Ghostty loads config-file files after the
     whole config, and colours set outside a theme win over it, so Noctalia's theme = noctalia line
     can stay as it is."""
 
@@ -1963,9 +1963,9 @@ class GhosttyTerminal:
     live_reload = True
     kitty_only = False
     neutral = NO_KITTY_EXTRAS
-    MANAGED = "kitty-styler.ghostty"
+    MANAGED = "shellac.ghostty"
     INCLUDE = f"config-file = ?{MANAGED}"
-    INCLUDE_NOTE = "# Kitty Styler's settings; loaded after this file, so they win."
+    INCLUDE_NOTE = "# Shellac's settings; loaded after this file, so they win."
 
     def __init__(self, conf=None):
         xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -2169,7 +2169,7 @@ class GhosttyTerminal:
                 lines.pop()
         new_text = "\n".join(lines) + "\n" if lines else ""
         managed_text = "\n".join(([f"# Theme: {theme}"] if theme else [])
-                                 + ["# Written by kitty-styler; loaded last from the Ghostty config.",
+                                 + ["# Written by Shellac; loaded last from the Ghostty config.",
                                     "# Changes here are overwritten.", *body]) + "\n"
         if shutil.which("ghostty"):
             with tempfile.TemporaryDirectory() as tmp:
@@ -3022,7 +3022,7 @@ class PluginPicker(Gtk.Window):
         self.win.refresh()
 
 
-SHARE_FILE_NAME = "kitty-styler-share.txt"
+SHARE_FILE_NAME = "shellac-share.txt"
 
 
 class ShareWindow(Gtk.Window):
@@ -3082,7 +3082,7 @@ class ShareWindow(Gtk.Window):
     def on_copy(self, _btn, code):
         self.get_clipboard().set_content(Gdk.ContentProvider.new_for_bytes(
             "text/plain;charset=utf-8", GLib.Bytes.new(code.encode())))
-        self.copied.set_label("Copied. Send it to anyone with Kitty Styler.")
+        self.copied.set_label("Copied. Send it to anyone with Shellac.")
         self.copied.set_visible(True)
 
     def pick_file(self, saving, done):
@@ -3209,7 +3209,7 @@ class ImportCheck(Gtk.Window):
 
 class StylerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Kitty Styler", default_width=1350, default_height=780)
+        super().__init__(application=app, title="Shellac", default_width=1350, default_height=780)
         self.themes = load_themes()
         # Themes made from a share code's colours: {"Shared: …": conf text}.
         self.shared_themes = {}
@@ -3533,7 +3533,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                         and not self.updates.failed(latest):
                     self.install_update()
                 else:
-                    self.update_banner_label.set_label(f"Kitty Styler {latest['tag']} is available")
+                    self.update_banner_label.set_label(f"Shellac {latest['tag']} is available")
                     self.update_banner.set_reveal_child(True)
             return False
 
@@ -3685,7 +3685,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                 box.set_visible(False)
             else:
                 # The prompt choices are worked out at start, so starship shows up after a restart.
-                label.set_label("starship is installed. Restart Kitty Styler to style the prompt; "
+                label.set_label("starship is installed. Restart Shellac to style the prompt; "
                                 "changes not applied yet are lost.")
                 btn.set_label("Restart")
                 btn.disconnect_by_func(self.on_install)
@@ -3700,7 +3700,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                 def restart(_installs):
                     write_atomic(PENDING_IMPORT, code)
                     os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
-                ImportCheck(self, [("Kitty Styler restarts, then loads the share code again with its prompt "
+                ImportCheck(self, [("Shellac restarts, then loads the share code again with its prompt "
                                     "settings. Changes not applied yet are lost.")], [], restart,
                             heading="starship is installed.", ok_label="Restart now", cancel_label="Later",
                             on_cancel=lambda: self.status.set_label(
@@ -3770,14 +3770,14 @@ class StylerWindow(Gtk.ApplicationWindow):
         if "prompt" in skipped:
             if incoming.get("prompt_mode") in ("styled", "starship") and not STARSHIP_BIN:
                 notes.append("The prompt settings need starship, which isn't installed.")
-                installs.append(("starship", "then Kitty Styler restarts and loads the prompt settings"))
+                installs.append(("starship", "then Shellac restarts and loads the prompt settings"))
             else:
-                notes.append("The prompt settings are left out: Kitty Styler can't style this PC's shell prompt.")
+                notes.append("The prompt settings are left out: Shellac can't style this PC's shell prompt.")
         if "shell" in skipped:
             notes.append("Some shell settings are left out: zsh, or the zsh plugin they change, isn't "
                          "set up here.")
         if "kitty" in skipped:
-            notes.append(f"Some {TERMINAL.label} options are left out: this Kitty Styler or "
+            notes.append(f"Some {TERMINAL.label} options are left out: this Shellac or "
                          f"{TERMINAL.label} doesn't have them.")
         if incoming.get("prompt_mode") == "base" and "prompt_mode" in values:
             notes.append("They use their shell's own prompt, which a share code can't carry. You get your "
@@ -3850,7 +3850,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         if "starship" in pending and "starship" in chosen:
             text, config, runs = pending["starship"]
             if runs and "starship_runs" not in chosen:
-                text = "\n".join(["# Shared through Kitty Styler; the parts that run programs were left out.",
+                text = "\n".join(["# Shared through Shellac; the parts that run programs were left out.",
                                   *toml_dump(drop_options(config, runs))]).strip() + "\n"
             values["shared_starship"] = text
         self.renders.pop("starship", None)
@@ -4014,7 +4014,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             name = name if name and not name.endswith(" prompt") else "its own prompt"
             out = f"{TERMINAL.label.capitalize()} starts {KITTY_SHELL}, and its prompt is {name}. Apply leaves it as it is."
             if strip_switch(read(SHELL_RC[KITTY_SHELL]).splitlines())[1]:
-                out += f" Apply removes Kitty Styler's starship lines from {rc}."
+                out += f" Apply removes Shellac's starship lines from {rc}."
         else:
             out = ("Your starship.toml as it is." if mode == "starship" else
                    "Apply writes a prompt block into starship.toml (backed up first).")
@@ -4227,7 +4227,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         return [
             *prompt("ls -la ~/code"),
             [t("drwxr-xr-x  "), t("themes/", k[12], "b"), t("   "), t("run.sh", k[10], "b"), t("   "),
-             t("kitty-styler.py", k[2]), t("   README.md   "), t("backup.tar.gz", k[1], "b"),
+             t("shellac.py", k[2]), t("   README.md   "), t("backup.tar.gz", k[1], "b"),
              t("   "), t("link", k[14], "b"), t(" -> "), t("target", k[6])],
             *prompt("git diff --stat"),
             [t("@@ -12,3 +12,4 @@ ", k[6]), t("def apply(self):", fg)],
@@ -4325,8 +4325,8 @@ SHARED_THEME = "Shared: "
 # starship.toml options that make starship run a program: the [custom] modules, plus these keys
 # and any *_binary key in the other modules (starship print-config --default, 1.27).
 STARSHIP_RUNS = ("command", "commands", "when", "use_stdin", "shell")
-# Where an import waits while Kitty Styler restarts after installing starship.
-PENDING_IMPORT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "kitty-styler-import")
+# Where an import waits while Shellac restarts after installing starship.
+PENDING_IMPORT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "shellac-import")
 
 
 def color_snapshot(conf):
@@ -4338,7 +4338,7 @@ def color_snapshot(conf):
 
 
 def strip_styler_starship(text):
-    """starship.toml without Kitty Styler's prompt and palette blocks, for a share code."""
+    """starship.toml without Shellac's prompt and palette blocks, for a share code."""
     out, block = [], None
     for line in strip_prompt_block(text).splitlines():
         if line == STARSHIP_BEGIN:
@@ -4475,7 +4475,7 @@ def read_share_code(text):
             if data is not None:
                 break
     elif re.match(r"ks\d+:", code):
-        raise ValueError("That share code is from a newer Kitty Styler. Update this one first.")
+        raise ValueError("That share code is from a newer Shellac. Update this one first.")
     else:
         raise ValueError(f'That is not a share code; they start with "{SHARE_PREFIX}".')
     if data is None:
@@ -4570,7 +4570,7 @@ def prompt_block(p):
     langs = "".join(f"${name}" for name in LANG_SYMBOLS) if shown["p_langs"] else ""
     lines = [
         PROMPT_BEGIN,
-        "# Managed by Kitty Styler; changes here are overwritten when you press Apply.",
+        "# Managed by Shellac; changes here are overwritten when you press Apply.",
         PROMPT_STATE + json.dumps(state, ensure_ascii=False),
         toml_kv("format", "$os$username$hostname$directory$git_branch$git_status"
                 + ("$line_break" if p["p_lines"] == "2" else "") + "$character"),
@@ -4692,7 +4692,7 @@ def write_atomic(path, text):
     # Write through symlinks (dotfile managers), so the link itself stays.
     path = os.path.realpath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.kitty-styler-tmp"
+    tmp = f"{path}.shellac-tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     if os.path.exists(path):
@@ -4802,7 +4802,7 @@ def apply_starship(theme, colors):
     # Without this, Noctalia's hook would switch starship back on the next wallpaper change.
     turn_off = set_noctalia_starship(False, dry_run=True)
     turned_off = turned_off or turn_off
-    block = [STARSHIP_BEGIN, "# Written by kitty-styler; pick Noctalia in Kitty Styler to undo."]
+    block = [STARSHIP_BEGIN, "# Written by Shellac; pick Noctalia in Shellac to undo."]
     if turned_off:
         block.append(STARSHIP_FLAG)
     if prev:
@@ -5021,7 +5021,7 @@ def apply_zsh(s):
     if info["omz"] and plugins != info["plugins"]:
         if plugins or not info["default_if_empty"]:
             out[info["at"]:info["at"]] = [ZSH_PLUGINS_BEGIN,
-                                          "# Managed by Kitty Styler; this list wins over any plugins= above.",
+                                          "# Managed by Shellac; this list wins over any plugins= above.",
                                           f"plugins=({' '.join(plugins)})", ZSH_PLUGINS_END]
         else:
             note.append("Plugins not changed: with none ticked, your zsh config loads its own default list.")
@@ -5030,7 +5030,7 @@ def apply_zsh(s):
         while out and not out[-1].strip():
             out.pop()
         state = {key: s[key] for _l, key, *_r in ZSH_KEYS}
-        out += ["", ZSH_BEGIN, "# Managed by Kitty Styler; changes here are overwritten when you press Apply.",
+        out += ["", ZSH_BEGIN, "# Managed by Shellac; changes here are overwritten when you press Apply.",
                 ZSH_STATE + json.dumps(state), *body, ZSH_END]
     new = "\n".join(out) + "\n"
     if new == text or (not text.endswith("\n") and new == text + "\n"):
@@ -5068,7 +5068,7 @@ def try_in_kitty(settings, colors, themes=None):
     kitty = shutil.which("kitty")
     if not kitty:
         return "kitty was not found."
-    tmp = tempfile.mkdtemp(prefix="kitty-styler-try-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+    tmp = tempfile.mkdtemp(prefix="shellac-try-", dir=os.environ.get("XDG_RUNTIME_DIR"))
     paths = try_paths(tmp)
     try:
         if os.path.isdir(KITTY_DIR):
@@ -5102,7 +5102,7 @@ def try_in_kitty(settings, colors, themes=None):
     kenv = dict(os.environ, KITTY_CONFIG_DIRECTORY=kdir)
     if os.path.exists(paths["KITTY_STYLER_STARSHIP"]):
         kenv["STARSHIP_CONFIG"] = paths["KITTY_STYLER_STARSHIP"]
-    cmd = [kitty, "--config", os.path.join(kdir, "kitty.conf"), "--class", "kitty-styler-try",
+    cmd = [kitty, "--config", os.path.join(kdir, "kitty.conf"), "--class", "shellac-try",
            "--title", "kitty (try)"]
     if KITTY_SHELL == "zsh":
         kenv["ZDOTDIR"] = zdot
@@ -5145,7 +5145,18 @@ class StylerApp(Gtk.Application):
         (self.props.active_window or StylerWindow(self)).present()
 
 
+def move_old_state():
+    """Shellac was Kitty Styler until 1.4.0: its state folder (update settings, picked terminal) moves over once."""
+    old, new = os.path.join(CONFIG_HOME, "kitty-styler"), os.path.dirname(UPDATE_STATE)
+    if os.path.isdir(old) and not os.path.exists(new):
+        try:
+            os.rename(old, new)
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
+    move_old_state()
     # Used by install.sh: list the missing extras, or install them from a terminal (sudo, not pkexec).
     if sys.argv[1:2] == ["--missing-extras"]:
         for name in EXTRAS:
