@@ -25,7 +25,14 @@ Every change shows up in a live preview before anything is written.
 - **Live preview**: a mock terminal with a prompt, `ls`, a diff, an error, all 16 colours and the tab bar,
   drawn on your wallpaper when it can find one, so opacity is visible. The prompt is your real one: the
   app asks your shell (or starship) to draw it in the background, so Powerlevel10k, oh-my-zsh themes,
-  fish and bash prompts show as they really look, including the error state.
+  fish and bash prompts show as they really look, including the error state. A second, inactive window
+  split off below shows borders, corners, margin and padding, faded text and the unfocused cursor. The
+  preview also draws the bold and italic fonts, ligatures, the scrollbar, cursor blinking and the cursor
+  trail (as kitty's plain trail), and adds example lines for the zsh behaviour options you set. Only
+  shader effects and the title bar on tiling compositors (which draw none) are left out.
+- **Try in kitty**: opens a real kitty window with the settings as they are in the app, shader effects
+  and trail styles included, without saving anything. It runs Apply on temporary copies of your
+  kitty.conf, starship.toml and shell config, and the copies are deleted when the window closes.
 - **Prompt**: keep your own prompt, switch the shell to starship with your own `starship.toml`, or style
   starship here: segment styles (plain, bubbles, arrows, slanted, blocks), one or two lines, and per-part
   colours for the OS icon, user and host, folder, git, error code, duration, language versions and clock.

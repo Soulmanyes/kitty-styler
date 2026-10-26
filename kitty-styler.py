@@ -6,6 +6,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -65,7 +66,7 @@ BLOCK_END = "# END_KITTY_STYLER"
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
 APP_ID = "io.github.soulmanyes.KittyStyler"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = "Soulmanyes/kitty-styler"
 UPDATE_STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
                             "kitty-styler", "updates.json")
@@ -77,6 +78,7 @@ KITTY_COLORS = {
     "active_tab_foreground": "#000000", "active_tab_background": "#eeeeee",
     "inactive_tab_foreground": "#444444", "inactive_tab_background": "#999999",
     "tab_bar_background": None,
+    "active_border_color": "#00ff00", "inactive_border_color": "#cccccc",
     "color0": "#000000", "color1": "#cc0403", "color2": "#19cb00", "color3": "#cecb00",
     "color4": "#0d73cc", "color5": "#cb1ed1", "color6": "#0dcdcd", "color7": "#dddddd",
     "color8": "#767676", "color9": "#f2201f", "color10": "#23fd00", "color11": "#fffd00",
@@ -285,18 +287,18 @@ DEPENDS = {"cursor_trail": ("0", ("trail_style", "cursor_trail_decay", "cursor_t
            "scrollbar": (OFF_SCROLLBAR, ("scrollbar_width", "scrollbar_handle_opacity", "scrollbar_radius",
                                          "scrollbar_handle_color", "scrollbar_track_opacity"))}
 DEPENDENT = {k: parent for parent, (_off, keys) in DEPENDS.items() for k in keys}
+# Tiling compositors draw no title bar for kitty, so the preview doesn't either.
+TILING = next((name for env, name in (("HYPRLAND_INSTANCE_SIGNATURE", "Hyprland"), ("SWAYSOCK", "Sway"),
+                                      ("NIRI_SOCKET", "niri")) if os.environ.get(env)), None)
 # Notes shown under a row.
 ROW_NOTES = {
-    "cursor_trail_color": "The trail only shows when the cursor moves; not drawn in the preview.",
-    "scrollbar_track_opacity": "The scrollbar is not drawn in the preview.",
+    "trail_style": "The preview draws every style as the plain trail; Try in kitty shows the real one.",
+    "scrollbar": "The preview acts as if it is scrolled back. For the mouse choices, hover over the preview.",
+    "hide_window_decorations": (f"{TILING} draws no title bar for kitty, so this only matters on other desktops."
+                                if TILING else "Title bar changes show in new kitty windows."),
+    "effect": ("Effects are not drawn in the preview; Try in kitty shows them. Animated effects (matrix, fireworks, northern lights,"
+               " spotlight) redraw all the time and use more power."),
 }
-# Under the last Window row, which is Effect when this kitty has effects.
-ROW_NOTES["effect" if len(EFFECTS) > 1 else "hide_window_decorations"] = (
-    "Bold and italic fonts, borders, faded text, title bar and effects are not drawn in the preview. "
-    "Title bar changes show in new kitty windows.")
-if len(EFFECTS) > 1:
-    ROW_NOTES["effect"] += (" Animated effects (matrix, fireworks, northern lights, spotlight) redraw all the time"
-                            " and use more power.")
 # Starship prompt. Colours are ANSI names, so they follow the kitty theme (and the Noctalia palette).
 PROMPT_BEGIN = "# >>> KITTY STYLER PROMPT >>>"
 PROMPT_END = "# <<< KITTY STYLER PROMPT <<<"
@@ -434,7 +436,9 @@ ZSH_OPTIONS += [
 ZSH_KEYS = [o for o in ZSH_OPTIONS if o[1]]
 TOP_HEADINGS = ("Prompt", "Shell (zsh)", *(heading for heading, _opts in OPTION_GROUPS))
 # Commands the preview shows as not found.
-PREVIEW_UNKNOWN = {"sl"}
+PREVIEW_UNKNOWN = {"sl", "gti"}
+# Text rows of the inactive window split off below the preview's main one.
+INACTIVE_ROWS = 5
 CHOICE_NOTES = {"cursor_blink_interval": {"-1": "-1 (system default)", "0": "0 (no blink)"},
                 "cursor_trail": {"0": "0 (off)"},
                 "cursor_trail_decay": {"0.05 0.2": "Fast", "0.1 0.4": "Normal", "0.2 0.6": "Slow",
@@ -595,10 +599,13 @@ def detect_os():
 
 
 def pts(value, i=0):
-    """Number i of a kitty size like "4" or "2.0 6" in pixels (pt at 96 dpi); 0 when unreadable."""
+    """Number i of a kitty size like "4", "2.0 6" or "3px" in pixels (pt at 96 dpi); 0 when unreadable."""
     try:
         parts = value.split()
-        return float((parts[i] if i < len(parts) else parts[-1]).removesuffix("pt")) * 96 / 72
+        part = parts[i] if i < len(parts) else parts[-1]
+        if part.endswith("px"):
+            return float(part[:-2])
+        return float(part.removesuffix("pt")) * 96 / 72
     except (ValueError, IndexError):
         return 0.0
 
@@ -606,6 +613,25 @@ def pts(value, i=0):
 def hex_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def color_rgb(value, colors):
+    """A kitty colour setting (hex, a colour name, foreground or selection_background) as RGB floats."""
+    value = colors.get(value) if value in ("foreground", "selection_background") else value
+    if value.startswith("#"):
+        return hex_rgb(value)
+    rgba = Gdk.RGBA()
+    return (rgba.red, rgba.green, rgba.blue) if rgba.parse(value) else hex_rgb(colors["foreground"])
+
+
+def rounded_rect(cr, x, y, w, h, r):
+    r = max(0.0, min(r, w / 2, h / 2))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
 
 
 # ---- The shell kitty runs, its prompt, and switching it to starship ----
@@ -1024,6 +1050,84 @@ class Cursor(Gtk.DrawingArea):
         return False
 
 
+class Trail(Gtk.DrawingArea):
+    """kitty's plain cursor trail, on its own layer like the cursor.
+
+    Each corner of the trail chases the same corner of the new cursor. Corners on the side the
+    cursor moved towards use the fast decay time, the ones behind it the slow one, so the trail
+    stretches and then shrinks into the cursor.
+    """
+
+    def __init__(self):
+        super().__init__(can_target=False)
+        self.corners = None
+        self.tick_id = None
+        self.set_draw_func(self.draw)
+
+    @staticmethod
+    def corner_points(rect):
+        x, y, w, h = rect
+        return [[x + w, y], [x + w, y + h], [x, y + h], [x, y]]
+
+    def start(self, old, new, decay, color):
+        self.corners = self.corner_points(old)
+        self.target = self.corner_points(new)
+        self.decay, self.color, self.last = decay, color, None
+        if not self.tick_id:
+            self.tick_id = self.add_tick_callback(self.tick)
+
+    def tick(self, _widget, clock):
+        now = clock.get_frame_time() / 1e6
+        dt, self.last = (now - self.last if self.last else 0), now
+        fast, slow = self.decay
+        cx = sum(p[0] for p in self.target) / 4
+        cy = sum(p[1] for p in self.target) / 4
+        done = True
+        for (px, py), corner in zip(self.target, self.corners):
+            dx, dy = px - corner[0], py - corner[1]
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < 0.5:
+                corner[:] = px, py
+                continue
+            done = False
+            # Which way the corner points, as a cell diagonal: a beam's corners would otherwise all
+            # point up or down, and a sideways jump would move them all at the same speed.
+            ox, oy = (1 if px > cx else -1), (1 if py > cy else -1)
+            # 1 for a corner leading the move, 0 for one trailing it.
+            lead = ((ox * dx + oy * dy) / (2 ** 0.5 * dist) + 1) / 2
+            step = 1 - 2 ** (-10 * dt / max(1e-3, slow + (fast - slow) * lead))
+            corner[0] += dx * step
+            corner[1] += dy * step
+        self.queue_draw()
+        if done:
+            self.corners = self.tick_id = None
+            return False
+        return True
+
+    def draw(self, _area, cr, _w, _h):
+        if not self.corners:
+            return
+        # The outline of the four corners, so the shape never folds over itself.
+        pts_ = sorted(map(tuple, self.corners))
+        cross = (lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+        hull = []
+        for seq in (pts_, pts_[::-1]):
+            half = []
+            for p in seq:
+                while len(half) >= 2 and cross(half[-2], half[-1], p) <= 0:
+                    half.pop()
+                half.append(p)
+            hull += half[:-1]
+        if len(hull) < 3:
+            return
+        cr.move_to(*hull[0])
+        for p in hull[1:]:
+            cr.line_to(*p)
+        cr.close_path()
+        cr.set_source_rgb(*self.color)
+        cr.fill()
+
+
 class Preview(Gtk.DrawingArea):
     def __init__(self, app):
         super().__init__(hexpand=True, vexpand=True)
@@ -1038,7 +1142,20 @@ class Preview(Gtk.DrawingArea):
         # redraw took ~50 ms and made the dropdowns lag, so it is done once per size.
         self.bg_cache = None
         self.bg_rebuild_id = None
+        # Which cursor marker the focused cursor sits on; the trail demo moves it.
+        self.cursor_at = "\0cursor"
+        self.cursor_spots = {}
+        self.hover = False
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", self.on_hover, True)
+        motion.connect("leave", self.on_hover, False)
+        self.add_controller(motion)
         self.set_draw_func(self.draw)
+
+    def on_hover(self, _ctl, *args):
+        self.hover = args[-1]
+        if "hovered" in self.app.settings["scrollbar"]:
+            self.queue_draw()
 
     def build_bg(self, w, h):
         pw, ph = self.wallpaper.get_width(), self.wallpaper.get_height()
@@ -1084,6 +1201,8 @@ class Preview(Gtk.DrawingArea):
 
         mx = 30
         win = (mx, mx, w - 2 * mx, h - 2 * mx)
+        if not TILING and s["hide_window_decorations"] == "no":
+            win = self.draw_titlebar(cr, win)
         cr.rectangle(*win)
         cr.set_source_rgba(*hex_rgb(c["background"]), float(s["background_opacity"]))
         cr.fill()
@@ -1094,45 +1213,144 @@ class Preview(Gtk.DrawingArea):
         layout.set_text("M", -1)
         _ink, logical = layout.get_pixel_extents()
         # modify_font cell_width/cell_height widen the cells; glyphs stay their size, centred vertically.
-        cw = logical.width * float(s["modify_font cell_width"].rstrip("%")) / 100
-        lh = logical.height * float(s["modify_font cell_height"].rstrip("%")) / 100
-        yoff = (lh - logical.height) / 2
-        per_cell = cw != logical.width
-        # Margin and padding both show the background colour, so the preview adds them up.
-        pad = pts(s["window_padding_width"]) + pts(s["window_margin_width"])
+        self.cw = logical.width * float(s["modify_font cell_width"].rstrip("%")) / 100
+        self.lh = logical.height * float(s["modify_font cell_height"].rstrip("%")) / 100
+        self.yoff = (self.lh - logical.height) / 2
+        self.per_cell = self.cw != logical.width
 
         cr.save()
         cr.rectangle(*win)
         cr.clip()
         style, pl = TAB_STYLES[s["tab_bar"]]
-        tab_h = lh if style != "hidden" else 0
+        tab_h = self.lh if style != "hidden" else 0
         top = s["tab_bar_edge"] == "top"
         # Tab bar margins: outer is between the window edge and the bar, inner between the bar and the text.
         outer, inner = (pts(s["tab_bar_margin_height"], i) for i in (0, 1)) if tab_h else (0, 0)
         tab_y = win[1] + outer if top else win[1] + win[3] - outer - tab_h
-        text_y0 = win[1] + (outer + tab_h + inner if top else 0) + pad
+        # The rest holds two kitty windows: the main one, and an inactive one split off below it,
+        # so borders, faded text and the unfocused cursor have something to show on.
+        y0 = win[1] + (outer + tab_h + inner if top else 0)
+        y1 = win[1] + win[3] - (0 if top else outer + tab_h + inner)
+        main, other = self.app.sample_lines()
+        other = other[-INACTIVE_ROWS:]
+        frame = (pts(s["window_margin_width"]) + self.border_width() + pts(s["window_padding_width"]))
+        # The main window keeps at least 60% of the height.
+        split = max(y0 + (y1 - y0) * 0.6, y1 - 2 * frame - len(other) * self.lh)
+        spots, box = self.draw_window(cr, layout, (win[0], y0, win[2], split - y0), True, main)
+        unfocused, _box = self.draw_window(cr, layout, (win[0], split, win[2], y1 - split), False, other)
+        self.draw_scrollbar(cr, box)
+        if tab_h:
+            # After the text, so a preview taller than the window tucks under the tab bar.
+            mw = pts(s["tab_bar_margin_width"])
+            self.draw_tabs(cr, layout, win[0] + mw, tab_y, win[2] - 2 * mw, tab_h, style, pl, self.cw)
+        if "\0cursor" in unfocused:
+            shape = s["cursor_shape_unfocused"]
+            shape = s["cursor_shape"] if shape == "unchanged" else shape
+            cr.set_source_rgb(*hex_rgb(c["cursor"]))
+            if shape == "hollow":
+                x, y, cw, lh = self.cursor_rect(*unfocused["\0cursor"], "block")
+                cr.set_line_width(1)
+                cr.rectangle(x + 0.5, y + 0.5, cw - 1, lh - 1)
+                cr.stroke()
+            else:
+                cr.rectangle(*self.cursor_rect(*unfocused["\0cursor"], shape))
+                cr.fill()
+        # Where the focused cursor can be: after the command, or at its start while the trail demo runs.
+        self.cursor_spots = {k: self.cursor_rect(x, y, s["cursor_shape"]) for k, (x, y) in spots.items()}
+        rect = self.cursor_spots.get(self.cursor_at) or self.cursor_spots.get("\0cursor")
+        if rect:
+            self.cursor.place(rect, c["cursor"])
+        cr.restore()
 
-        x0 = win[0] + pad
-        cursor_xy = None
-        for i, line in enumerate(self.app.sample_lines()):
-            y = text_y0 + i * lh
+    def border_width(self):
+        # kitty rounds borders to whole pixels, at least one.
+        return max(1.0, round(pts(self.app.settings["window_border_width"])))
+
+    def cursor_rect(self, x, y, shape):
+        s = self.app.settings
+        if shape == "block":
+            return (x, y, self.cw, self.lh)
+        if shape == "beam":
+            return (x, y, max(1.0, pts(s["cursor_beam_thickness"])), self.lh)
+        th = max(1.0, pts(s["cursor_underline_thickness"]))
+        return (x, y + self.lh - th, self.cw, th)
+
+    def draw_titlebar(self, cr, win):
+        """The title bar kitty draws on desktops without a tiling compositor; returns the window below it."""
+        x, y, w, h = win
+        th = 30
+        cr.set_source_rgb(0.18, 0.18, 0.18)
+        cr.rectangle(x, y, w, th)
+        cr.fill()
+        title = PangoCairo.create_layout(cr)
+        title.set_markup(f"<b>{KITTY_SHELL or 'zsh'}</b>", -1)
+        _ink, logical = title.get_pixel_extents()
+        cr.set_source_rgb(0.87, 0.87, 0.87)
+        cr.move_to(x + (w - logical.width) / 2, y + (th - logical.height) / 2)
+        PangoCairo.show_layout(cr, title)
+        title.set_text("✕", -1)
+        cr.move_to(x + w - th, y + (th - logical.height) / 2)
+        PangoCairo.show_layout(cr, title)
+        return (x, y + th, w, h - th)
+
+    def draw_window(self, cr, layout, rect, active, lines):
+        """One kitty window: margin, border, padding, then its last lines that fit.
+
+        Returns where the cursor markers landed and the box inside the margin.
+        """
+        s, c = self.app.settings, self.app.colors
+        margin = pts(s["window_margin_width"])
+        border = self.border_width()
+        x, y, w, h = rect[0] + margin, rect[1] + margin, rect[2] - 2 * margin, rect[3] - 2 * margin
+        color = c["active_border_color"] if active else c["inactive_border_color"]
+        if s["draw_minimal_borders"] == "no" or margin > 0:
+            # Full borders; kitty also draws these whenever there is a margin.
+            if color:
+                rounded_rect(cr, x + border / 2, y + border / 2, w - border, h - border,
+                             pts(s["window_border_radius"]))
+                cr.set_line_width(border)
+                cr.set_source_rgb(*hex_rgb(color))
+                cr.stroke()
+        elif active:
+            # Minimal borders: only the line between this window and the one below.
+            cr.set_source_rgb(*hex_rgb(color or c["inactive_border_color"]))
+            cr.rectangle(x, y + h - border, w, border)
+            cr.fill()
+        inset = border + pts(s["window_padding_width"])
+        tx, ty, tw, th = x + inset, y + inset, max(0, w - 2 * inset), max(0, h - 2 * inset)
+        rows = int(th / self.lh + 0.01)  # n rows of float height must give n back
+        cr.save()
+        cr.rectangle(tx, ty, tw, th)
+        cr.clip()
+        # Like a terminal, the newest lines stay and older ones scroll off the top.
+        alpha = 1.0 if active else float(s["inactive_text_alpha"])
+        spots = self.draw_lines(cr, layout, lines[-rows:] if rows else [], tx, ty, tx + tw, alpha)
+        cr.restore()
+        return spots, (x, y, w, h)
+
+    def draw_lines(self, cr, layout, lines, x0, y0, right, alpha):
+        """Preview lines of (text, fg, bg, attrs) runs; returns where the \\0 markers are."""
+        cw, lh, yoff = self.cw, self.lh, self.yoff
+        spots = {}
+        for i, line in enumerate(lines):
+            y = y0 + i * lh
             x = x0
             for j, (text, fg, bg, attrs) in enumerate(line):
-                if text == "\0cursor":
-                    cursor_xy = (x, y)
+                if text in ("\0cursor", "\0home"):
+                    spots[text] = (x, y)
                     continue
                 if text.startswith("\0right"):
                     # Right prompt: the rest of the line ends at the right padding. Like zsh,
                     # drop it when it would run into the command. A character after the marker
                     # fills the gap (Powerlevel10k's lines between left and right).
                     rest = sum(len(t) for t, *_ in line[j + 1:])
-                    right_x = win[0] + win[2] - pad - rest * cw
+                    right_x = right - rest * cw
                     if right_x < x + cw:
                         break
                     fill = text[len("\0right"):]
                     if fill:
-                        cr.set_source_rgb(*hex_rgb(fg))
-                        self.draw_cells(cr, layout, fill * int((right_x - x) / cw), attrs, x, y, cw, lh, yoff)
+                        cr.set_source_rgba(*hex_rgb(fg), alpha)
+                        self.draw_cells(cr, layout, fill * int((right_x - x) / cw), attrs, x, y)
                     x = right_x
                     continue
                 n = len(text)
@@ -1140,41 +1358,62 @@ class Preview(Gtk.DrawingArea):
                     cr.set_source_rgb(*hex_rgb(bg))
                     cr.rectangle(x, y, n * cw, lh)
                     cr.fill()
-                markup = GLib.markup_escape_text(text)
-                if "b" in attrs:
-                    markup = f"<b>{markup}</b>"
-                if "i" in attrs:
-                    markup = f"<i>{markup}</i>"
-                if "u" in attrs:
-                    markup = f"<u>{markup}</u>"
-                cr.set_source_rgb(*hex_rgb(fg))
-                if text.isascii() and not per_cell:
-                    layout.set_markup(markup, -1)
+                cr.set_source_rgba(*hex_rgb(fg), alpha)
+                if text.isascii() and not self.per_cell:
+                    layout.set_markup(self.markup(text, attrs), -1)
                     cr.move_to(x, y + yoff)
                     PangoCairo.show_layout(cr, layout)
                 else:
-                    self.draw_cells(cr, layout, text, attrs, x, y, cw, lh, yoff)
+                    self.draw_cells(cr, layout, text, attrs, x, y)
                 x += n * cw
-        if tab_h:
-            # After the text, so a preview taller than the window tucks under the tab bar.
-            mw = pts(s["tab_bar_margin_width"])
-            self.draw_tabs(cr, layout, win[0] + mw, tab_y, win[2] - 2 * mw, tab_h, style, pl, cw)
-        if cursor_xy:
-            x, y = cursor_xy
-            shape = s["cursor_shape"]
-            if shape == "block":
-                rect = (x, y, cw, lh)
-            elif shape == "beam":
-                rect = (x, y, max(1.0, pts(s["cursor_beam_thickness"])), lh)
-            else:
-                th = max(1.0, pts(s["cursor_underline_thickness"]))
-                rect = (x, y + lh - th, cw, th)
-            self.cursor.place(rect, c["cursor"])
-        cr.restore()
+        return spots
 
-    @staticmethod
-    def draw_cells(cr, layout, text, attrs, x, y, cw, lh, yoff):
+    def markup(self, text, attrs, underline=True):
+        """Pango markup for a run: kitty's bold/italic font settings, ligatures, underline."""
+        s = self.app.settings
+        out = GLib.markup_escape_text(text)
+        bold, italic = "b" in attrs, "i" in attrs
+        key = "bold_italic_font" if bold and italic else "bold_font" if bold else "italic_font" if italic else None
+        face = s[key] if key else "auto"
+        if face != "auto":
+            # A family name, or a face like "JetBrainsMono Nerd Font ExtraBold" whose weight then
+            # wins over <b> below.
+            attr = "font_family" if face in self.app.fonts else "font_desc"
+            out = f'<span {attr}="{GLib.markup_escape_text(face)}">{out}</span>'
+        if bold:
+            out = f"<b>{out}</b>"
+        if italic:
+            out = f"<i>{out}</i>"
+        if underline and "u" in attrs:
+            out = f"<u>{out}</u>"
+        if s["disable_ligatures"] == "always":
+            out = f'<span font_features="liga=0, calt=0, dlig=0">{out}</span>'
+        return out
+
+    def draw_scrollbar(self, cr, box):
+        s, c = self.app.settings, self.app.colors
+        mode = s["scrollbar"]
+        # The preview counts as scrolled back, so only the mouse modes wait for a hover.
+        if mode == "never" or mode in ("hovered", "scrolled-and-hovered") and not self.hover:
+            return
+        x, y, w, h = box
+        border = self.border_width()
+        sw = float(s["scrollbar_width"]) * self.cw
+        sx = x + w - border - 0.1 * self.cw - sw
+        top, height = y + border, h - 2 * border
+        radius = min(float(s["scrollbar_radius"]) * self.cw, sw / 2)
+        track = float(s["scrollbar_track_opacity"])
+        if track:
+            cr.set_source_rgba(*hex_rgb(c["foreground"]), track)
+            rounded_rect(cr, sx, top, sw, height, radius)
+            cr.fill()
+        cr.set_source_rgba(*color_rgb(s["scrollbar_handle_color"], c), float(s["scrollbar_handle_opacity"]))
+        rounded_rect(cr, sx, top + height * 0.45, sw, max(self.lh, height * 0.3), radius)
+        cr.fill()
+
+    def draw_cells(self, cr, layout, text, attrs, x, y):
         """One character per cell, squeezing wide glyphs (Nerd Font icons) into one cell like kitty."""
+        cw, lh, yoff = self.cw, self.lh, self.yoff
         for ch in text:
             shape = CAP_SHAPES.get(ch)
             if shape:
@@ -1196,16 +1435,11 @@ class Preview(Gtk.DrawingArea):
                 cr.fill()
                 x += cw
                 continue
-            markup = GLib.markup_escape_text(ch)
-            if "b" in attrs:
-                markup = f"<b>{markup}</b>"
-            if "i" in attrs:
-                markup = f"<i>{markup}</i>"
             if "u" in attrs:
                 # Underline the whole cell, so letter-spaced text keeps a continuous line.
                 cr.rectangle(x, y + yoff + layout.get_pixel_extents()[1].height - 2, cw, 1)
                 cr.fill()
-            layout.set_markup(markup, -1)
+            layout.set_markup(self.markup(ch, attrs, underline=False), -1)
             ink, logical = layout.get_pixel_extents()
             # Nerd Font icons often draw past their advance width, so go by the ink too.
             left = min(0, ink.x)
@@ -1276,13 +1510,9 @@ class Preview(Gtk.DrawingArea):
                     cr.close_path()
                     cr.fill()
                     adv = tw + h * 0.5
-            markup = GLib.markup_escape_text(label)
             font_style = self.app.settings["active_tab_font_style" if active else "inactive_tab_font_style"]
-            if "bold" in font_style:
-                markup = f"<b>{markup}</b>"
-            if "italic" in font_style:
-                markup = f"<i>{markup}</i>"
-            layout.set_markup(markup, -1)
+            layout.set_markup(self.markup(label, ("b" if "bold" in font_style else "")
+                                          + ("i" if "italic" in font_style else "")), -1)
             cr.set_source_rgb(*hex_rgb(fg))
             cr.move_to(tx, y)
             PangoCairo.show_layout(cr, layout)
@@ -1403,7 +1633,11 @@ class StylerWindow(Gtk.ApplicationWindow):
         apply_btn.connect("clicked", self.on_apply)
         reset_btn = Gtk.Button(label="Reset to current")
         reset_btn.connect("clicked", self.on_reset)
+        try_btn = Gtk.Button(label="Try in kitty",
+                             tooltip_text="Open a kitty window with these settings, without saving them")
+        try_btn.connect("clicked", self.on_try)
         header.pack_end(apply_btn)
+        header.pack_end(try_btn)
         header.pack_start(reset_btn)
         self.set_titlebar(header)
 
@@ -1550,7 +1784,9 @@ class StylerWindow(Gtk.ApplicationWindow):
         side.set_child(grid)
         self.preview = Preview(self)
         self.preview.cursor = Cursor()
+        self.preview.trail = Trail()
         overlay = Gtk.Overlay(child=self.preview)
+        overlay.add_overlay(self.preview.trail)
         overlay.add_overlay(self.preview.cursor)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
         box.append(side)
@@ -1562,6 +1798,8 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.set_child(outer)
 
         self.blink_id = None
+        self.jump_id = None
+        self.history_have = None
         self.sync_dropdowns()
         self.ensure_render()
         if updater:
@@ -1874,6 +2112,8 @@ class StylerWindow(Gtk.ApplicationWindow):
             conf = parse_conf(read(NOCTALIA_THEME)) if NOCTALIA else self.base_colors
         colors = dict(KITTY_COLORS)
         colors.update({k: v for k, v in conf.items() if k in colors and v.startswith("#")})
+        if conf.get("active_border_color") == "none":
+            colors["active_border_color"] = None
         self.colors = colors
         if len(self.themes) == 1:
             note = ("No kitty themes found. Run  kitty +kitten themes  once (Esc quits it) so kitty downloads "
@@ -1905,6 +2145,15 @@ class StylerWindow(Gtk.ApplicationWindow):
         if interval != 0:
             ms = 500 if interval < 0 else int(interval * 1000)
             self.blink_id = GLib.timeout_add(ms, self.blink)
+            self.blink_since = time.monotonic()
+        # With a cursor trail, the cursor jumps to the start of the command and back to show it.
+        trail = self.settings["cursor_trail"] != "0"
+        if trail and not self.jump_id:
+            self.jump_id = GLib.timeout_add(1500, self.jump)
+        elif not trail and self.jump_id:
+            GLib.source_remove(self.jump_id)
+            self.jump_id = None
+            self.preview.cursor_at = "\0cursor"
         self.preview.queue_draw()
 
     def prompt_note_text(self):
@@ -1934,7 +2183,31 @@ class StylerWindow(Gtk.ApplicationWindow):
 
     def blink(self):
         cursor = self.preview.cursor
+        stop = float(self.settings["cursor_stop_blinking_after"])
+        if stop > 0 and time.monotonic() - self.blink_since > stop:
+            # kitty stops blinking after that long without typing; changing a setting counts as typing.
+            cursor.set_opacity(1)
+            self.blink_id = None
+            return False
         cursor.set_opacity(0 if cursor.get_opacity() else 1)
+        return True
+
+    def jump(self):
+        pv = self.preview
+        spots = pv.cursor_spots
+        new = "\0home" if pv.cursor_at == "\0cursor" else "\0cursor"
+        if "\0home" not in spots or "\0cursor" not in spots:
+            return True
+        old_rect, new_rect = spots[pv.cursor_at], spots[new]
+        pv.cursor_at = new
+        pv.cursor.place(new_rect, self.colors["cursor"])
+        pv.cursor.set_opacity(1)
+        s = self.settings
+        tx, ty = (int(v) for v in (s["cursor_trail_start_threshold"].split() * 2)[:2])
+        if abs(new_rect[0] - old_rect[0]) / pv.cw >= tx or abs(new_rect[1] - old_rect[1]) / pv.lh >= ty:
+            color = self.colors["cursor"] if s["cursor_trail_color"] == "none" else s["cursor_trail_color"]
+            fast, slow = (float(v) for v in (s["cursor_trail_decay"].split() * 2)[:2])
+            pv.trail.start(old_rect, new_rect, (fast, slow), color_rgb(color, self.colors))
         return True
 
     def sample_lines(self):
@@ -1991,7 +2264,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             color = color if z[key] == KEEP else z[key]
             return (col(color) if color else fg), attrs
 
-        def typed(cmd):
+        def typed(cmd, unknown=PREVIEW_UNKNOWN):
             """The command line as zsh-syntax-highlighting colours it."""
             out, first = [], True
             for tok in re.findall(r'"[^"]*"|\'[^\']*\'|\s+|[^\s"\']+', cmd):
@@ -1999,7 +2272,7 @@ class StylerWindow(Gtk.ApplicationWindow):
                 if tok.isspace():
                     pass
                 elif first:
-                    key, first = ("z_unknown" if tok in PREVIEW_UNKNOWN else "z_cmd"), False
+                    key, first = ("z_unknown" if tok in unknown else "z_cmd"), False
                 elif tok[0] in "\"'":
                     key = "z_string"
                 elif tok.startswith("-"):
@@ -2010,16 +2283,24 @@ class StylerWindow(Gtk.ApplicationWindow):
                 out.append((tok, color, None, attrs))
             return out
 
-        def prompt(cmd, cursor=False, error=None, slow=False, ghost=""):
+        def command(cmd, cursor, ghost, comment, unknown):
+            """What follows the prompt: the typed command, cursor, suggestion and a comment."""
+            out = [("\0home", fg, None, "")] if cursor else []
+            out += typed(cmd, unknown)
+            if cursor:
+                out.append(("\0cursor", fg, None, ""))
+            if ghost and self.zsh_info["suggest"]:
+                out.append((ghost, zcol("z_suggest")[0], None, ""))
+            if comment:
+                out.append((f"  # {comment}", k[8], None, ""))
+            return out
+
+        def prompt(cmd, cursor=False, error=None, slow=False, ghost="", comment="", unknown=PREVIEW_UNKNOWN):
             """The prompt as preview lines: optional blank line, then one or two lines."""
             if real:
                 rows, right = real[1][int(error or 0)]
                 lines = [real_runs(row) for row in rows] or [[]]
-                lines[-1] += typed(cmd)
-                if cursor:
-                    lines[-1].append(("\0cursor", fg, None, ""))
-                if ghost and self.zsh_info["suggest"]:
-                    lines[-1].append((ghost, zcol("z_suggest")[0], None, ""))
+                lines[-1] += command(cmd, cursor, ghost, comment, unknown)
                 if right:
                     lines[-1] += [("\0right", fg, None, "")] + real_runs(right)
                 return lines
@@ -2037,11 +2318,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             if p["p_gitst"] == "show":
                 left += seg("!?" if caps else "[!?]", p["p_gitst_color"])
             symbol = [(p["p_symbol"], col(p["p_err_color"] if error else p["p_ok_color"]), None, ""),
-                      (" ", fg, None, ""), *typed(cmd)]
-            if cursor:
-                symbol.append(("\0cursor", fg, None, ""))
-            if ghost and self.zsh_info["suggest"]:
-                symbol.append((ghost, zcol("z_suggest")[0], None, ""))
+                      (" ", fg, None, ""), *command(cmd, cursor, ghost, comment, unknown)]
             right = [("\0right", fg, None, "")]
             if error and p["p_status"] == "show":
                 right += seg(f"✘ {error}", p["p_status_color"])
@@ -2064,6 +2341,48 @@ class StylerWindow(Gtk.ApplicationWindow):
         def t(text, color=fg, attrs=""):
             return (text, color, None, attrs)
 
+        # Examples of the zsh behaviour settings that are not left as is.
+        z = self.settings if ZSH_AVAILABLE else {}
+        demos = []
+        if z.get("z_case") == "insensitive":
+            demos += prompt("cd Documents/", comment='typed "cd doc", then Tab')
+        elif z.get("z_case") == "sensitive":
+            demos += prompt("cd doc", comment="Tab finds nothing: the folder is Documents/")
+        if z.get("z_correct") == "off":
+            demos += [*prompt("gti status"), [t("zsh: command not found: gti")]]
+        elif z.get("z_correct") == "commands":
+            demos += [*prompt("gti status"), [t("zsh: correct 'gti' to 'git' [nyae]? "), t("y", fg, "b")]]
+        elif z.get("z_correct") == "all":
+            demos += [*prompt("ls Docments"), [t("zsh: correct 'Docments' to 'Documents' [nyae]? "), t("y", fg, "b")]]
+        if z.get("z_autocd") == "on":
+            demos += prompt("Documents", comment="same as cd Documents", unknown=())
+        elif z.get("z_autocd") == "off":
+            demos += [*prompt("Documents", unknown={"Documents"}), [t("zsh: command not found: Documents")]]
+        if z.get("z_history", KEEP) != KEEP:
+            if self.history_have is None:
+                self.history_have = history_lines()
+            # Apply leaves the size alone when that would cut the history file down.
+            ok = int(z["z_history"]) >= self.history_have
+            demos += [*prompt("echo $SAVEHIST"), [t(z["z_history"] if ok else "(unchanged)"), t(
+                "  # commands kept in ~/.zsh_history" if ok else
+                f"  # your history already has {self.history_have} lines", k[8])]]
+        if z.get("z_share") == "on":
+            demos += [*prompt("fc -ln -1"), [t("make deploy"), t("  # typed in another kitty window", k[8])]]
+        elif z.get("z_share") == "off":
+            demos += [*prompt("fc -ln -1"), [t("ls -la ~/code"), t("  # only this window's commands", k[8])]]
+        if self.zsh_info["suggest"] and z.get("z_suggest_src") == "history completion":
+            demos += prompt("cd Doc", ghost="uments/", comment="suggested by completion")
+        elif self.zsh_info["suggest"] and z.get("z_suggest_src") == "history":
+            demos += prompt("cd Doc", comment="no suggestion: not in your history yet")
+        if z.get("z_beep") in ("on", "off"):
+            demos += prompt("cd xyz", comment="Tab finds nothing: " + ("beep" if z["z_beep"] == "on" else "no beep"))
+
+        inactive = [
+            *prompt("cat todo.txt"),
+            [t("- try a new theme")],
+            [t("- fix the build")],
+            *prompt("", cursor=True),
+        ]
         return [
             *prompt("ls -la ~/code"),
             [t("drwxr-xr-x  "), t("themes/", k[12], "b"), t("   "), t("run.sh", k[10], "b"), t("   "),
@@ -2087,8 +2406,9 @@ class StylerWindow(Gtk.ApplicationWindow):
             [t("0123456789 {}[]() <= >= != -> => === ~ | & ** // %")],
             *prompt("sl", error="1", slow=True),
             [t(NOT_FOUND.get(KITTY_SHELL, NOT_FOUND["zsh"]))],
+            *demos,
             *prompt("git sta", cursor=True, error="127", ghost="tus"),
-        ]
+        ], inactive
 
     # ---- actions ----
     def on_reset(self, _btn):
@@ -2098,6 +2418,22 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.sync_dropdowns()
         self.ensure_render()
         self.status.set_label("Reset to what kitty.conf has now.")
+
+    def on_try(self, btn):
+        btn.set_sensitive(False)
+        self.status.set_label("Opening a kitty window with these settings…")
+        settings, colors = dict(self.settings), dict(self.colors)
+
+        def work():
+            error = try_in_kitty(settings, colors)
+            GLib.idle_add(done, error)
+
+        def done(error):
+            btn.set_sensitive(True)
+            self.status.set_label(error or "Opened a kitty window with these settings. Nothing was saved; "
+                                           "press Apply to keep them.")
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def on_apply(self, _btn):
         try:
@@ -2126,7 +2462,7 @@ def prune_backups():
         os.remove(os.path.join(folder, old))
 
 
-def apply_all(s, themes, colors, file_conf):
+def apply_all(s, themes, colors, file_conf, reload=True):
     """Write kitty.conf, the theme file and starship.toml from the settings; returns a status message."""
     style, pl = TAB_STYLES[s["tab_bar"]]
     wanted = {"font_family": s["font_family"], "tab_bar_style": style}
@@ -2198,7 +2534,8 @@ def apply_all(s, themes, colors, file_conf):
         out += ([""] if out else []) + [BLOCK_BEGIN, *extra, BLOCK_END]
     write_atomic(CONF, "\n".join(out) + "\n")
 
-    subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
+    if reload:
+        subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
     msg = ["Applied and reloaded open kitty windows."]
     if backup:
         msg.append(f"Backup: {backup}")
@@ -2650,6 +2987,15 @@ def zsh_style(value, default, style=None):
     return ",".join(parts) or "none"
 
 
+def history_lines():
+    """Lines in ~/.zsh_history (next to .zshrc), 0 when there is none."""
+    try:
+        with open(os.path.join(os.path.dirname(ZSHRC), ".zsh_history"), "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
 def zsh_lines(s, note):
     """The settings block body; empty when everything is left as is. note collects warnings."""
     out = []
@@ -2674,12 +3020,7 @@ def zsh_lines(s, note):
             out.append(f"{'setopt' if s[key] == 'on' else 'unsetopt'} {option}")
     if s["z_history"] != KEEP:
         size = int(s["z_history"])
-        hist = os.path.join(os.path.dirname(ZSHRC), ".zsh_history")
-        try:
-            with open(hist, "rb") as f:
-                have = sum(1 for _ in f)
-        except OSError:
-            have = 0
+        have = history_lines()
         if size < have:
             # A smaller SAVEHIST cuts the history file down on the next save.
             note.append(f"History size not changed: your history already has {have} lines.")
@@ -2732,6 +3073,94 @@ def apply_zsh(s):
     return " ".join(note + ["Shell settings saved; they apply in new shells, or run  exec zsh  in an open one."])
 
 
+# ---- Try in kitty: Apply on copies of the config files, then a kitty that uses the copies ----
+TRY_ZSH_LINKS = (".zshenv", ".zprofile", ".zlogin", ".zlogout", ".zsh_history")
+
+
+def try_paths(tmp):
+    """Where each config file goes in a try directory, keyed by the env variable that points the app there."""
+    return {"KITTY_STYLER_DIR": os.path.join(tmp, "kitty"),
+            "KITTY_STYLER_STARSHIP": os.path.join(tmp, "starship.toml"),
+            "KITTY_STYLER_NOCTALIA": os.path.join(tmp, "noctalia-settings.toml"),
+            "KITTY_STYLER_ZSHRC": os.path.join(tmp, "zsh", ".zshrc"),
+            "KITTY_STYLER_FISHRC": os.path.join(tmp, "config.fish"),
+            "KITTY_STYLER_BASHRC": os.path.join(tmp, ".bashrc")}
+
+
+def try_in_kitty(settings, colors):
+    """Open a kitty window with the settings as Apply would write them, without touching the real files.
+
+    Copies the config files to a temp directory, runs Apply there in a child process (the paths come
+    from env variables, read at import), then starts kitty on the copies. Returns an error message
+    or "".
+    """
+    kitty = shutil.which("kitty")
+    if not kitty:
+        return "kitty was not found."
+    tmp = tempfile.mkdtemp(prefix="kitty-styler-try-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+    paths = try_paths(tmp)
+    try:
+        if os.path.isdir(KITTY_DIR):
+            shutil.copytree(KITTY_DIR, paths["KITTY_STYLER_DIR"], ignore=shutil.ignore_patterns("*.bak-*"),
+                            ignore_dangling_symlinks=True)
+        for env, real in (("KITTY_STYLER_STARSHIP", STARSHIP_CONF), ("KITTY_STYLER_NOCTALIA", NOCTALIA_SETTINGS),
+                          ("KITTY_STYLER_ZSHRC", ZSHRC), ("KITTY_STYLER_FISHRC", SHELL_RC["fish"]),
+                          ("KITTY_STYLER_BASHRC", SHELL_RC["bash"])):
+            os.makedirs(os.path.dirname(paths[env]), exist_ok=True)
+            if os.path.isfile(real):
+                shutil.copy2(real, paths[env])
+        # With ZDOTDIR moved, zsh would skip the other startup files; link the real ones in.
+        zdot = os.path.dirname(paths["KITTY_STYLER_ZSHRC"])
+        for name in TRY_ZSH_LINKS:
+            real = os.path.join(os.path.dirname(ZSHRC), name)
+            if os.path.exists(real):
+                os.symlink(real, os.path.join(zdot, name))
+        with open(os.path.join(tmp, "try.json"), "w", encoding="utf-8") as f:
+            json.dump({"settings": settings, "colors": colors}, f)
+        env = dict(os.environ, KITTY_STYLER_SHELL=KITTY_SHELL or "", **paths)
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), "--try", tmp], env=env,
+                           capture_output=True, text=True, timeout=60, check=False)
+        if r.returncode:
+            raise OSError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip()
+                          else f"exit code {r.returncode}")
+    except (OSError, subprocess.SubprocessError, shutil.Error) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return f"Could not open the try window: {e}"
+
+    kdir = paths["KITTY_STYLER_DIR"]
+    kenv = dict(os.environ, KITTY_CONFIG_DIRECTORY=kdir)
+    if os.path.exists(paths["KITTY_STYLER_STARSHIP"]):
+        kenv["STARSHIP_CONFIG"] = paths["KITTY_STYLER_STARSHIP"]
+    cmd = [kitty, "--config", os.path.join(kdir, "kitty.conf"), "--class", "kitty-styler-try",
+           "--title", "Kitty Styler: try"]
+    if KITTY_SHELL == "zsh":
+        kenv["ZDOTDIR"] = zdot
+    elif KITTY_SHELL == "bash":
+        cmd += ["bash", "--rcfile", paths["KITTY_STYLER_BASHRC"], "-i"]
+    elif KITTY_SHELL == "fish":
+        conf_d = os.path.join(os.path.dirname(SHELL_RC["fish"]), "conf.d")
+        cmd += ["fish", "--no-config", "-C",
+                f"for f in {shlex.quote(conf_d)}/*.fish; source $f; end; source {shlex.quote(paths['KITTY_STYLER_FISHRC'])}"]
+    # The temp directory goes away when the window closes.
+    subprocess.Popen(["sh", "-c", 'trap \'rm -rf "$0"\' EXIT; "$@"', tmp, *cmd], env=kenv,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return ""
+
+
+def try_apply(tmp):
+    """The child process of try_in_kitty: Apply to the copies in tmp. Refuses any real path."""
+    tmp = os.path.realpath(tmp)
+    for path in (CONF, STARSHIP_CONF, NOCTALIA_SETTINGS, *SHELL_RC.values()):
+        if not os.path.realpath(path).startswith(tmp + os.sep):
+            print(f"refusing: {path} is outside {tmp}", file=sys.stderr)
+            return 2
+    with open(os.path.join(tmp, "try.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    apply_all(data["settings"], load_themes(), data["colors"], parse_conf_file(CONF), reload=False)
+    return 0
+
+
 class StylerApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
@@ -2748,6 +3177,8 @@ if __name__ == "__main__":
             if not find_extra(name) and (name != "slangc" or len(TRAIL_STYLES) > 1 or len(EFFECTS) > 1):
                 print(f"{name}\t{EXTRAS[name]['what']}")
         sys.exit(0)
+    if sys.argv[1:2] == ["--try"] and len(sys.argv) == 3:
+        sys.exit(try_apply(sys.argv[2]))
     if sys.argv[1:2] == ["--install-extras"]:
         results = [install_extra(name, gui=False) for name in sys.argv[2:] or
                    [n for n in EXTRAS if not find_extra(n)]]
