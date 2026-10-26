@@ -1902,10 +1902,297 @@ class FootTerminal:
         pass
 
 
+GHOSTTY_OPTIONS = {
+    "font_size": (None, "12.0"), "bold_font": (None, "auto"), "italic_font": (None, "auto"),
+    "bold_italic_font": (None, "auto"), "modify_font cell_height": (None, "100%"),
+    "modify_font cell_width": (None, "100%"), "background_opacity": (None, "1.00"),
+    "window_padding_width": (None, "2"), "hide_window_decorations": (["no", "yes"], "no"),
+    "cursor_shape": (None, "block"), "cursor_blink_interval": (["-1", "0", "0.5"], "-1"),
+}
+GHOSTTY_FONTS = {"font_family": "font-family", "bold_font": "font-family-bold", "italic_font": "font-family-italic",
+                 "bold_italic_font": "font-family-bold-italic"}
+GHOSTTY_COLORS = {"foreground": "foreground", "background": "background", "cursor": "cursor-color",
+                  "cursor_text_color": "cursor-text", "selection_foreground": "selection-foreground",
+                  "selection_background": "selection-background"}
+GHOSTTY_SHAPES = {"block": "block", "beam": "bar", "underline": "underline"}
+
+
+def ghostty_line(line):
+    """(key, value) of a Ghostty config line, quotes taken off; None for comments and blank lines."""
+    text = line.strip()
+    if not text or text.startswith("#") or "=" not in text:
+        return None
+    key, _eq, value = text.partition("=")
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    return key.strip(), value
+
+
+class GhosttyTerminal:
+    """Ghostty. Keys its config sets itself are edited in place; the rest, and a picked theme's colours,
+    go in kitty-styler.ghostty, loaded with config-file. Ghostty loads config-file files after the
+    whole config, and colours set outside a theme win over it, so Noctalia's theme = noctalia line
+    can stay as it is."""
+
+    name = "ghostty"
+    label = "Ghostty"
+    live_reload = True
+    kitty_only = False
+    neutral = NO_KITTY_EXTRAS
+    MANAGED = "kitty-styler.ghostty"
+    INCLUDE = f"config-file = ?{MANAGED}"
+    INCLUDE_NOTE = "# Kitty Styler's settings; loaded after this file, so they win."
+
+    def __init__(self, conf=None):
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        folder = os.path.join(xdg, "ghostty")
+        found = next((p for p in (os.path.join(folder, "config.ghostty"), os.path.join(folder, "config"))
+                      if os.path.isfile(p)), os.path.join(folder, "config.ghostty"))
+        self.conf = conf or os.environ.get("KITTY_STYLER_GHOSTTY") or found
+        self.dir = os.path.dirname(self.conf)
+        self.managed = os.path.join(self.dir, self.MANAGED)
+        self.noctalia_theme = os.path.join(self.dir, "themes", "noctalia")
+        self.notes = []
+
+    def supports(self, key):
+        return key in GHOSTTY_OPTIONS or key in GHOSTTY_FONTS or key not in TERMINAL_KEYS
+
+    def choices(self, key, choices):
+        return GHOSTTY_OPTIONS.get(key, (None,))[0] or choices
+
+    def theme_note(self):
+        return (f"Apply saves this theme in {self.MANAGED}, which your Ghostty config loads last, so it wins "
+                f'over its theme line. Pick "{BASE_LABEL}" to go back to your own colours.')
+
+    def parse(self, path, skip=(), seen=None):
+        """{key: value} as Ghostty reads it: the file, then its config-file files in order. Repeatable
+        keys: font families keep their first value after a "" reset; palette entries become palette N."""
+        seen = set() if seen is None else seen
+        real = os.path.realpath(path)
+        if real in seen or real in skip:
+            return {}
+        seen.add(real)
+        out, later = {}, []
+        for line in read(path).splitlines():
+            kv = ghostty_line(line)
+            if not kv:
+                continue
+            key, value = kv
+            if key == "config-file":
+                later.append(value)
+            elif key == "theme" and not os.path.isabs(value) and "/" not in value and ":" not in value:
+                out["theme"] = value
+            elif key in GHOSTTY_FONTS.values():
+                if value == "":
+                    out.pop(key, None)
+                else:
+                    out.setdefault(key, value)
+            elif key == "palette" and "=" in value:
+                index, _eq, color = value.partition("=")
+                out[f"palette {index.strip()}"] = color.strip()
+            else:
+                out[key] = value
+        for entry in later:
+            target = os.path.join(os.path.dirname(path), os.path.expanduser(entry.removeprefix("?")))
+            out.update(self.parse(target, skip, seen))
+        return out
+
+    def theme_colors(self, name):
+        """Colours of a Ghostty theme by name: the user's themes folder, then Ghostty's own."""
+        for folder in (os.path.join(self.dir, "themes"), "/usr/share/ghostty/themes"):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return self.parse(path)
+        return {}
+
+    @property
+    def noctalia(self):
+        own = self.parse(self.conf, skip={os.path.realpath(self.managed)})
+        return bool(own.get("theme") == "noctalia" and os.path.exists(self.noctalia_theme)
+                    and '"ghostty"' in read(NOCTALIA_SETTINGS)
+                    and not any(k in own for k in GHOSTTY_COLORS.values()))
+
+    def to_kitty(self, data):
+        if data.get("theme"):
+            data = {**self.theme_colors(data["theme"]), **data}
+        out = {key: default for key, (_choices, default) in GHOSTTY_OPTIONS.items()}
+        out["font_family"] = data.get("font-family") or "monospace"
+        for key, name in GHOSTTY_FONTS.items():
+            if key != "font_family":
+                out[key] = data.get(name) or "auto"
+        try:
+            size = float(data.get("font-size", "12"))
+            out["font_size"] = f"{size:.1f}" if round(size, 1) == size else seconds(size)
+        except ValueError:
+            pass
+        for key, name in (("modify_font cell_height", "adjust-cell-height"),
+                          ("modify_font cell_width", "adjust-cell-width")):
+            m = re.fullmatch(r"(-?\d+(?:\.\d+)?)%", data.get(name, ""))
+            if m:
+                out[key] = f"{100 + float(m.group(1)):g}%"
+        try:
+            out["background_opacity"] = f"{float(data.get('background-opacity', '1')):.2f}"
+        except ValueError:
+            pass
+        if re.fullmatch(r"\d+", data.get("window-padding-x", "")):
+            out["window_padding_width"] = data["window-padding-x"]
+        out["hide_window_decorations"] = "yes" if data.get("window-decoration") in ("none", "false") else "no"
+        shape = data.get("cursor-style", "block")
+        out["cursor_shape"] = next((k for k, v in GHOSTTY_SHAPES.items() if v == shape), "block")
+        blink = data.get("cursor-style-blink", "")
+        out["cursor_blink_interval"] = "0" if blink == "false" else "0.5" if blink == "true" else "-1"
+        if data.get("command"):
+            out["shell"] = data["command"]
+        for key, name in GHOSTTY_COLORS.items():
+            color = hex_color(data.get(name, "")) or hex_color("#" + data.get(name, ""))
+            if color:
+                out[key] = color
+        for i in range(16):
+            color = hex_color(data.get(f"palette {i}", ""))
+            if color:
+                out[f"color{i}"] = color
+        return out
+
+    def to_ghostty(self, s):
+        """{kitty key: {ghostty key: value}}."""
+        # "auto" is no line at all: Ghostty then takes bold and italic from the main font.
+        out = {key: {name: "" if s[key] == "auto" else s[key]} for key, name in GHOSTTY_FONTS.items()}
+        out["font_size"] = {"font-size": s["font_size"]}
+        for key, name in (("modify_font cell_height", "adjust-cell-height"),
+                          ("modify_font cell_width", "adjust-cell-width")):
+            out[key] = {name: f"{float(s[key].rstrip('%')) - 100:g}%"}
+        out["background_opacity"] = {"background-opacity": s["background_opacity"]}
+        pad = str(int(float(s["window_padding_width"])))
+        out["window_padding_width"] = {"window-padding-x": pad, "window-padding-y": pad}
+        out["hide_window_decorations"] = {"window-decoration": "none" if s["hide_window_decorations"] == "yes"
+                                          else "auto"}
+        out["cursor_shape"] = {"cursor-style": GHOSTTY_SHAPES.get(s["cursor_shape"], "block")}
+        blink = float(s["cursor_blink_interval"])
+        out["cursor_blink_interval"] = {"cursor-style-blink": "" if blink < 0 else "true" if blink > 0 else "false"}
+        return out
+
+    def read_conf(self, without_theme=False):
+        return self.to_kitty(self.parse(self.conf, skip={os.path.realpath(self.managed)} if without_theme else ()))
+
+    def theme(self):
+        first = read(self.managed).split("\n", 1)[0]
+        if not first.startswith("# Theme: "):
+            return None, ""
+        colors = self.to_kitty({k: v for k, v in self.parse(self.managed).items() if k != "theme"})
+        return first[len("# Theme: "):].strip(), "".join(
+            f"{k} {colors[k]}\n" for k in (*GHOSTTY_COLORS, *(f"color{i}" for i in range(16))) if k in colors)
+
+    def noctalia_colors(self):
+        colors = self.to_kitty(self.parse(self.noctalia_theme))
+        return {k: v for k, v in colors.items() if k in GHOSTTY_COLORS or k.startswith("color")}
+
+    def shell(self):
+        return kitty_shell(self.read_conf())
+
+    def write(self, s, themes, file_conf):
+        text = read(self.conf)
+        lines = text.splitlines()
+        managed = {}
+        for line in read(self.managed).splitlines():
+            kv = ghostty_line(line)
+            if kv and kv[0] not in GHOSTTY_COLORS.values() and kv[0] != "palette" and kv[1] != "":
+                managed[kv[0]] = kv[1]
+        changed = {key for key in GHOSTTY_FONTS | GHOSTTY_OPTIONS if not same(str(s[key]), str(file_conf.get(key, "")))}
+        if "font_family" in changed:
+            changed |= {key for key in GHOSTTY_FONTS if s[key] == "auto"}
+        # Where the file sets each key itself: the last line (font families: the first, the main font).
+        own = {}
+        for i, line in enumerate(lines):
+            kv = ghostty_line(line)
+            if kv and kv[0] not in ("palette", "config-file") and kv[1] != "" \
+                    and (kv[0] not in GHOSTTY_FONTS.values() or kv[0] not in own):
+                own[kv[0]] = i
+        for key, values in self.to_ghostty(s).items():
+            if key not in changed:
+                continue
+            for name, value in values.items():
+                if name in own and name not in managed:
+                    i = own[name]
+                    lines[i] = f"{name} = {value}" if value else f"{name} ="
+                elif value:
+                    managed[name] = value
+                else:
+                    managed.pop(name, None)
+        theme = s["theme"] if s["theme"] != BASE_LABEL else None
+        body = []
+        for name, value in managed.items():
+            if name in GHOSTTY_FONTS.values():
+                body.append(f'{name} = ""')  # a font family adds a fallback unless the list is reset first
+            body.append(f"{name} = {value}")
+        if theme:
+            colors = parse_conf(themes[theme])
+            body += [f"{name} = {hex_color(colors[k])}" for k, name in GHOSTTY_COLORS.items()
+                     if hex_color(colors.get(k, ""))]
+            body += [f"palette = {i}={hex_color(colors[f'color{i}'])}" for i in range(16)
+                     if hex_color(colors.get(f"color{i}", ""))]
+        include = [i for i, line in enumerate(lines) if line.strip() == self.INCLUDE]
+        if body and not include:
+            while lines and not lines[-1].strip():
+                lines.pop()
+            lines += ([""] if lines else []) + [self.INCLUDE_NOTE, self.INCLUDE]
+        elif not body and include:
+            for i in reversed(include):
+                del lines[i]
+                if i > 0 and lines[i - 1] == self.INCLUDE_NOTE:
+                    del lines[i - 1]
+            while lines and not lines[-1].strip():
+                lines.pop()
+        new_text = "\n".join(lines) + "\n" if lines else ""
+        managed_text = "\n".join(([f"# Theme: {theme}"] if theme else [])
+                                 + ["# Written by kitty-styler; loaded last from the Ghostty config.",
+                                    "# Changes here are overwritten.", *body]) + "\n"
+        if shutil.which("ghostty"):
+            with tempfile.TemporaryDirectory() as tmp:
+                conf = os.path.join(tmp, "config.ghostty")
+                with open(conf, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                with open(os.path.join(tmp, self.MANAGED), "w", encoding="utf-8") as f:
+                    f.write(managed_text)
+                for name in os.listdir(self.dir) if os.path.isdir(self.dir) else []:
+                    if name == "themes":
+                        os.symlink(os.path.join(self.dir, name), os.path.join(tmp, name))
+                r = subprocess.run(["ghostty", "+validate-config", f"--config-file={conf}"], capture_output=True,
+                                   text=True, timeout=15, check=False)
+                if r.returncode != 0:
+                    err = (r.stderr or r.stdout).strip().splitlines()
+                    raise OSError(f"left {self.conf} alone: Ghostty rejects the result "
+                                  f"({err[-1].replace(tmp, self.dir) if err else '?'})")
+        backup = None
+        if text and new_text != text:
+            backup = f"{self.conf}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(self.conf, backup)
+            prune_backups(self.conf)
+        if body:
+            write_atomic(self.managed, managed_text)
+        elif os.path.exists(self.managed):
+            os.remove(self.managed)
+        if new_text != text:
+            write_atomic(self.conf, new_text)
+        return backup
+
+    def reload(self):
+        """Like Noctalia's reload hook: the systemd unit, then the D-Bus action of a single instance."""
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 10}
+        try:
+            subprocess.run(["systemctl", "--user", "reload", "app-com.mitchellh.ghostty.service"],
+                           check=False, **quiet)
+            subprocess.run(["gdbus", "call", "--session", "--dest", "com.mitchellh.ghostty", "--object-path",
+                            "/com/mitchellh/ghostty", "--method", "org.gtk.Actions.Activate", "reload-config",
+                            "[]", "{}"], check=False, **quiet)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 # Settings that belong to the terminal (the rest are the prompt's and the shell's).
 TERMINAL_KEYS = {key for _l, key, _c, _d in OPTIONS} | {"font_family", "tab_bar", "trail_style", "effect"}
-TERMINALS = {"kitty": KittyTerminal, "alacritty": AlacrittyTerminal, "foot": FootTerminal}
-TERMINAL_BINARIES = {"kitty": "kitty", "alacritty": "alacritty", "foot": "foot"}
+TERMINALS = {"kitty": KittyTerminal, "alacritty": AlacrittyTerminal, "foot": FootTerminal, "ghostty": GhosttyTerminal}
+TERMINAL_BINARIES = {"kitty": "kitty", "alacritty": "alacritty", "foot": "foot", "ghostty": "ghostty"}
 TERMINAL_STATE = os.path.join(os.path.dirname(UPDATE_STATE), "terminal")
 ZSH_INSTALLED = ZSH_AVAILABLE
 
@@ -1922,7 +2209,8 @@ def default_terminal():
     have = available_terminals()
     term = os.environ.get("TERM", "")
     launched = "alacritty" if os.environ.get("ALACRITTY_WINDOW_ID") else \
-               "kitty" if os.environ.get("KITTY_WINDOW_ID") else "foot" if term.startswith("foot") else None
+               "kitty" if os.environ.get("KITTY_WINDOW_ID") else "foot" if term.startswith("foot") else \
+               "ghostty" if os.environ.get("GHOSTTY_RESOURCES_DIR") else None
     for name in (os.environ.get("KITTY_STYLER_TERMINAL"), read(TERMINAL_STATE).strip(), launched):
         if name in have:
             return name
