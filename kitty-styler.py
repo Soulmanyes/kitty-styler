@@ -2864,15 +2864,21 @@ def same(a, b):
         return a == b
 
 
-# Share codes: "ks1:" + base64url(zlib(JSON)). The number goes up if the format changes, so
-# older codes keep working. A share code comes from someone else: import only takes values the
-# app offers itself (see StylerWindow.check_import), never raw text that ends up in a config file.
-SHARE_PREFIX = "ks1:"
+# Share codes: "ks2:" + base62(zlib(JSON)). The number goes up if the format changes, so
+# older codes keep working. Letters and digits only: chat apps turn text between two underscores
+# into italics and drop them, which broke ks1 codes (base64url). A share code comes from someone
+# else: import only takes values the app offers itself (see StylerWindow.check_import), never raw
+# text that ends up in a config file.
+SHARE_PREFIX = "ks2:"
+SHARE_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 FONT_KEYS = ("font_family", "bold_font", "italic_font", "bold_italic_font")
 SHARE_MAX_CHARS = 20000
 SHARE_MAX_JSON = 200000
-# Numbers kitty.conf can hold that aren't in our lists, like font_size 13.5 or "2.0 2.0".
-SHARE_NUMBER = re.compile(r"-?\d+(\.\d+)?(pt|px|%)?( -?\d+(\.\d+)?(pt|px|%)?){0,3}")
+# How far apart the two underscores a chat app ate from a ks1 code may be, for the repair.
+KS1_ITALIC_SPAN = 120
+# Numbers and colours kitty.conf can hold that aren't in our lists, like font_size 13.5,
+# "2.0 2.0" or #dde1e6.
+SHARE_NUMBER = re.compile(r"-?\d+(\.\d+)?(pt|px|%)?( -?\d+(\.\d+)?(pt|px|%)?){0,3}|#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?")
 # Where an import waits while Kitty Styler restarts after installing starship.
 PENDING_IMPORT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "kitty-styler-import")
 
@@ -2883,7 +2889,33 @@ def make_share_code(settings):
     if data.get("theme") == BASE_LABEL:
         data["theme"] = None
     blob = json.dumps({"settings": data, "noctalia": NOCTALIA}, separators=(",", ":")).encode()
-    return SHARE_PREFIX + base64.urlsafe_b64encode(zlib.compress(blob, 9)).decode().rstrip("=")
+    # zlib output starts with 0x78, so no leading zero bytes get lost in the number.
+    n, digits = int.from_bytes(zlib.compress(blob, 9), "big"), []
+    while n:
+        n, d = divmod(n, 62)
+        digits.append(SHARE_DIGITS[d])
+    return SHARE_PREFIX + "".join(reversed(digits))
+
+
+def unpack_share(packed):
+    """The JSON object in zlib bytes, or None when they are damaged or cut short."""
+    try:
+        unzip = zlib.decompressobj()
+        blob = unzip.decompress(packed, SHARE_MAX_JSON)
+        if unzip.unconsumed_tail or not unzip.eof:
+            return None
+        data = json.loads(blob)
+        data["settings"].keys()  # a dict inside a dict, or one of these errors
+    except (ValueError, zlib.error, KeyError, TypeError, AttributeError):
+        return None
+    return data
+
+
+def ks1_bytes(body):
+    try:
+        return base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    except ValueError:
+        return b""
 
 
 def read_share_code(text):
@@ -2893,21 +2925,31 @@ def read_share_code(text):
         raise ValueError("Paste a share code first.")
     if len(code) > SHARE_MAX_CHARS:
         raise ValueError("That is too long to be a share code.")
-    if not code.startswith(SHARE_PREFIX):
-        if re.match(r"ks\d+:", code):
-            raise ValueError("That share code is from a newer Kitty Styler. Update this one first.")
+    data = None
+    if code.startswith(SHARE_PREFIX):
+        body = code[len(SHARE_PREFIX):]
+        if body and all(ch in SHARE_DIGITS for ch in body):
+            n = 0
+            for ch in body:
+                n = n * 62 + SHARE_DIGITS.index(ch)
+            data = unpack_share(n.to_bytes((n.bit_length() + 7) // 8, "big"))
+    elif code.startswith("ks1:"):
+        # Kitty Styler 1.2.0 codes. If a chat app ate one pair of underscores, put it back.
+        body = code[4:]
+        data = unpack_share(ks1_bytes(body))
+        for i in range(len(body) + 1) if data is None else ():
+            for j in range(i, min(i + KS1_ITALIC_SPAN, len(body)) + 1):
+                data = unpack_share(ks1_bytes(f"{body[:i]}_{body[i:j]}_{body[j:]}"))
+                if data is not None:
+                    break
+            if data is not None:
+                break
+    elif re.match(r"ks\d+:", code):
+        raise ValueError("That share code is from a newer Kitty Styler. Update this one first.")
+    else:
         raise ValueError(f'That is not a share code; they start with "{SHARE_PREFIX}".')
-    body = code[len(SHARE_PREFIX):]
-    try:
-        packed = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
-        unzip = zlib.decompressobj()
-        blob = unzip.decompress(packed, SHARE_MAX_JSON)
-        if unzip.unconsumed_tail:
-            raise ValueError
-        data = json.loads(blob)
-        data["settings"].keys()  # a dict inside a dict, or one of these errors
-    except (ValueError, zlib.error, KeyError, TypeError, AttributeError):
-        raise ValueError("That share code is damaged or incomplete. Copy it again.") from None
+    if data is None:
+        raise ValueError("That share code is damaged or incomplete. Copy it again.")
     return data
 
 
