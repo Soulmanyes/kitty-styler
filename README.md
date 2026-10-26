@@ -28,8 +28,9 @@ Every change shows up in a live preview before anything is written.
   fish and bash prompts show as they really look, including the error state. A second, inactive window
   split off below shows borders, corners, margin and padding, faded text and the unfocused cursor. The
   preview also draws the bold and italic fonts, ligatures, the scrollbar, cursor blinking and the cursor
-  trail (as kitty's plain trail), and adds example lines for the zsh behaviour options you set. Only
-  shader effects and the title bar on tiling compositors (which draw none) are left out.
+  trail, with look-alikes of its blaze, lightning and motion blur styles. It adds example lines for the
+  zsh behaviour options you set. Only shader effects and the title bar on tiling compositors (which draw
+  none) are left out.
 - **Try in kitty**: opens a real kitty window with the settings as they are in the app, shader effects
   and trail styles included, without saving anything. It runs Apply on temporary copies of your
   kitty.conf, starship.toml and shell config, and the copies are deleted when the window closes.

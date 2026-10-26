@@ -2,9 +2,11 @@
 """Kitty Styler: pick kitty's look from dropdowns and see it live before applying."""
 import glob
 import json
+import math
 import os
 import platform
 import pwd
+import random
 import re
 import shlex
 import shutil
@@ -25,10 +27,12 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
 gi.require_version("PangoCairo", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 warnings.filterwarnings("ignore", ".*cairo_set_source_pixbuf", DeprecationWarning)
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo  # noqa: E402
 
 # updater.py sits next to this file (the command in ~/.local/bin is a symlink). A copy of
 # kitty-styler.py on its own still runs, just without the Updates section.
@@ -66,7 +70,7 @@ BLOCK_END = "# END_KITTY_STYLER"
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
 APP_ID = "io.github.soulmanyes.KittyStyler"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPO = "Soulmanyes/kitty-styler"
 UPDATE_STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
                             "kitty-styler", "updates.json")
@@ -292,7 +296,7 @@ TILING = next((name for env, name in (("HYPRLAND_INSTANCE_SIGNATURE", "Hyprland"
                                       ("NIRI_SOCKET", "niri")) if os.environ.get(env)), None)
 # Notes shown under a row.
 ROW_NOTES = {
-    "trail_style": "The preview draws every style as the plain trail; Try in kitty shows the real one.",
+    "trail_style": "The preview draws look-alikes of these styles; Try in kitty shows the real ones.",
     "scrollbar": "The preview acts as if it is scrolled back. For the mouse choices, hover over the preview.",
     "hide_window_decorations": (f"{TILING} draws no title bar for kitty, so this only matters on other desktops."
                                 if TILING else "Title bar changes show in new kitty windows."),
@@ -1050,35 +1054,102 @@ class Cursor(Gtk.DrawingArea):
         return False
 
 
-class Trail(Gtk.DrawingArea):
-    """kitty's plain cursor trail, on its own layer like the cursor.
+# Seconds the blaze and the lightning bolt trails stay on screen, and the blaze colours.
+TRAIL_LIFE = {"blaze": 0.4, "lightning": 0.3}
+BLAZE_FILL = (1.0, 0.69, 0.0)
+BLAZE_EDGE = (1.0, 0.27, 0.0)
 
-    Each corner of the trail chases the same corner of the new cursor. Corners on the side the
-    cursor moved towards use the fast decay time, the ones behind it the slow one, so the trail
-    stretches and then shrinks into the cursor.
+
+def convex_hull(points):
+    """The outline around points, so a shape made from moving corners never folds over itself."""
+    pts_ = sorted(set(map(tuple, points)))
+    if len(pts_) < 3:
+        return pts_
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    hull = []
+    for seq in (pts_, pts_[::-1]):
+        half = []
+        for p in seq:
+            while len(half) >= 2 and cross(half[-2], half[-1], p) <= 0:
+                half.pop()
+            half.append(p)
+        hull += half[:-1]
+    return hull
+
+
+class Trail(Gtk.Widget):
+    """kitty's cursor trail, on its own layer like the cursor.
+
+    Plain: each corner of the trail chases the same corner of the new cursor. Corners on the side
+    the cursor moved towards use the fast decay time, the ones behind it the slow one, so the trail
+    stretches and then shrinks into the cursor. The shader styles (blaze, lightning, motion blur)
+    are kitty GPU shaders; these are look-alikes drawn from their descriptions, not ports.
+
+    Drawn as shape nodes, not a DrawingArea: that repainted a window-sized image every frame,
+    25-30 ms each, which made the whole app crawl while the trail demo ran.
     """
+
 
     def __init__(self):
         super().__init__(can_target=False)
         self.corners = None
         self.tick_id = None
-        self.set_draw_func(self.draw)
 
     @staticmethod
     def corner_points(rect):
         x, y, w, h = rect
         return [[x + w, y], [x + w, y + h], [x, y + h], [x, y]]
 
-    def start(self, old, new, decay, color):
+    def start(self, old, new, decay, color, style="plain"):
         self.corners = self.corner_points(old)
+        self.prev = [list(c) for c in self.corners]
         self.target = self.corner_points(new)
-        self.decay, self.color, self.last = decay, color, None
+        self.decay, self.color, self.style, self.last, self.age = decay, color, style, None, 0.0
+        self.swept = convex_hull(self.corners + self.target)
+        if style == "lightning":
+            self.make_bolt(old, new)
         if not self.tick_id:
             self.tick_id = self.add_tick_callback(self.tick)
+
+    def make_bolt(self, old, new):
+        """A jagged line between the two cursor centres, plus a few short forks off it."""
+        (ax, ay), (bx, by) = ((r[0] + r[2] / 2, r[1] + r[3] / 2) for r in (old, new))
+        length = max(1.0, math.hypot(bx - ax, by - ay))
+        # Unit vector across the line, for the sideways kinks.
+        nx, ny = -(by - ay) / length, (bx - ax) / length
+        n = 9
+        self.bolt = [(ax, ay)]
+        for i in range(1, n):
+            f, kink = i / n, random.uniform(-0.12, 0.12) * length
+            self.bolt.append((ax + (bx - ax) * f + nx * kink, ay + (by - ay) * f + ny * kink))
+        self.bolt.append((bx, by))
+        self.forks = []
+        for i in (2, 4, 6):
+            x, y = self.bolt[i]
+            side = random.choice((-1, 1))
+            reach = random.uniform(0.08, 0.16) * length
+            self.forks.append([(x, y), (x + ((bx - ax) / length * 0.5 + nx * side) * reach,
+                                        y + ((by - ay) / length * 0.5 + ny * side) * reach)])
 
     def tick(self, _widget, clock):
         now = clock.get_frame_time() / 1e6
         dt, self.last = (now - self.last if self.last else 0), now
+        self.age += dt
+        if self.style in TRAIL_LIFE:
+            done = self.age >= TRAIL_LIFE[self.style]
+        else:
+            done = self.chase(dt)
+        self.queue_draw()
+        if done:
+            self.corners = self.tick_id = None
+            return False
+        return True
+
+    def chase(self, dt):
+        """Move the corners one frame towards the cursor; True once they are all there."""
+        self.prev = [list(c) for c in self.corners]
         fast, slow = self.decay
         cx = sum(p[0] for p in self.target) / 4
         cy = sum(p[1] for p in self.target) / 4
@@ -1098,34 +1169,71 @@ class Trail(Gtk.DrawingArea):
             step = 1 - 2 ** (-10 * dt / max(1e-3, slow + (fast - slow) * lead))
             corner[0] += dx * step
             corner[1] += dy * step
-        self.queue_draw()
-        if done:
-            self.corners = self.tick_id = None
-            return False
-        return True
+        return done
 
-    def draw(self, _area, cr, _w, _h):
+    def shapes(self):
+        """What to draw this frame: (points, closed, rgb, alpha, stroke width or 0 for a fill)."""
+        if self.style == "blaze":
+            fade = (1 - self.age / TRAIL_LIFE["blaze"]) ** 2
+            return [(self.swept, True, BLAZE_FILL, 0.55 * fade, 0),
+                    (self.swept, True, BLAZE_EDGE, fade, 1.5)]
+        if self.style == "lightning":
+            fade = 1 - self.age / TRAIL_LIFE["lightning"]
+            lines = [self.bolt, *self.forks]
+            return ([(pts, False, self.color, 0.3 * fade, 7) for pts in lines]
+                    + [(pts, False, (1.0, 1.0, 1.0), fade, 1.5) for pts in lines])
+        if self.style == "motion blur":
+            # The trail at in-between positions since the last frame, blended into a soft streak.
+            steps = 6
+            return [(convex_hull([[a + (b - a) * k / steps for a, b in zip(p, c)]
+                                  for p, c in zip(self.prev, self.corners)]), True, self.color, 0.3, 0)
+                    for k in range(1, steps + 1)]
+        return [(convex_hull(self.corners), True, self.color, 1.0, 0)]
+
+    def do_snapshot(self, snapshot):
         if not self.corners:
             return
-        # The outline of the four corners, so the shape never folds over itself.
-        pts_ = sorted(map(tuple, self.corners))
-        cross = (lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
-        hull = []
-        for seq in (pts_, pts_[::-1]):
-            half = []
-            for p in seq:
-                while len(half) >= 2 and cross(half[-2], half[-1], p) <= 0:
-                    half.pop()
-                half.append(p)
-            hull += half[:-1]
-        if len(hull) < 3:
+        shapes = [s for s in self.shapes() if len(s[0]) >= (3 if s[1] else 2) and s[3] > 0]
+        if not shapes:
             return
-        cr.move_to(*hull[0])
-        for p in hull[1:]:
-            cr.line_to(*p)
-        cr.close_path()
-        cr.set_source_rgb(*self.color)
-        cr.fill()
+        if hasattr(Gsk, "PathBuilder"):
+            for pts, closed, rgb, alpha, width in shapes:
+                builder = Gsk.PathBuilder.new()
+                builder.move_to(*pts[0])
+                for p in pts[1:]:
+                    builder.line_to(*p)
+                if closed:
+                    builder.close()
+                color = Gdk.RGBA()
+                color.red, color.green, color.blue, color.alpha = (*rgb, alpha)
+                if width:
+                    stroke = Gsk.Stroke.new(width)
+                    stroke.set_line_join(Gsk.LineJoin.ROUND)
+                    stroke.set_line_cap(Gsk.LineCap.ROUND)
+                    snapshot.append_stroke(builder.to_path(), stroke, color)
+                else:
+                    snapshot.append_fill(builder.to_path(), Gsk.FillRule.WINDING, color)
+            return
+        # GTK before 4.14: cairo, but only over the box the shapes cover.
+        xs = [p[0] for s in shapes for p in s[0]]
+        ys = [p[1] for s in shapes for p in s[0]]
+        x0, y0 = math.floor(min(xs)) - 4, math.floor(min(ys)) - 4
+        cr = snapshot.append_cairo(Graphene.Rect().init(x0, y0, math.ceil(max(xs)) - x0 + 5,
+                                                        math.ceil(max(ys)) - y0 + 5))
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        for pts, closed, rgb, alpha, width in shapes:
+            cr.move_to(*pts[0])
+            for p in pts[1:]:
+                cr.line_to(*p)
+            if closed:
+                cr.close_path()
+            cr.set_source_rgba(*rgb, alpha)
+            if width:
+                cr.set_line_width(width)
+                cr.stroke()
+            else:
+                cr.fill()
 
 
 class Preview(Gtk.DrawingArea):
@@ -2209,7 +2317,7 @@ class StylerWindow(Gtk.ApplicationWindow):
         if abs(new_rect[0] - old_rect[0]) / pv.cw >= tx or abs(new_rect[1] - old_rect[1]) / pv.lh >= ty:
             color = self.colors["cursor"] if s["cursor_trail_color"] == "none" else s["cursor_trail_color"]
             fast, slow = (float(v) for v in (s["cursor_trail_decay"].split() * 2)[:2])
-            pv.trail.start(old_rect, new_rect, (fast, slow), color_rgb(color, self.colors))
+            pv.trail.start(old_rect, new_rect, (fast, slow), color_rgb(color, self.colors), s.get("trail_style", "plain"))
         return True
 
     def sample_lines(self):
@@ -2431,8 +2539,12 @@ class StylerWindow(Gtk.ApplicationWindow):
 
         def done(error):
             btn.set_sensitive(True)
-            self.status.set_label(error or "Opened a kitty window with these settings. Nothing was saved; "
-                                           "press Apply to keep them.")
+            msg = "Opened a kitty window with these settings. Nothing was saved; press Apply to keep them."
+            if TRAIL_STYLES.get(settings.get("trail_style")) or EFFECTS.get(settings.get("effect")):
+                # kitty compiles a shader the first time it is used and doesn't respond meanwhile.
+                msg += (" The first time an effect or trail style is used, kitty compiles it, so the new"
+                        " window can stay blank or show as not responding for a few seconds.")
+            self.status.set_label(error or msg)
             return False
         threading.Thread(target=work, daemon=True).start()
 
@@ -3133,7 +3245,7 @@ def try_in_kitty(settings, colors):
     if os.path.exists(paths["KITTY_STYLER_STARSHIP"]):
         kenv["STARSHIP_CONFIG"] = paths["KITTY_STYLER_STARSHIP"]
     cmd = [kitty, "--config", os.path.join(kdir, "kitty.conf"), "--class", "kitty-styler-try",
-           "--title", "Kitty Styler: try"]
+           "--title", "kitty (try)"]
     if KITTY_SHELL == "zsh":
         kenv["ZDOTDIR"] = zdot
     elif KITTY_SHELL == "bash":
