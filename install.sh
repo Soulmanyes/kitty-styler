@@ -24,6 +24,21 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
+if [ ! -f "$SRC/kitty-styler.py" ]; then
+    # run through curl | sh: download the latest release (main if there is none yet) and
+    # run its own install.sh. releases/latest redirects to .../tag/<tag>
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    say "Downloading Kitty Styler"
+    tag=$(curl -fsSLo /dev/null -w '%{url_effective}' \
+        https://github.com/Soulmanyes/kitty-styler/releases/latest | sed -n 's|.*/tag/||p')
+    ref=${tag:+tags/$tag}
+    curl -fsSL "https://github.com/Soulmanyes/kitty-styler/archive/refs/${ref:-heads/main}.tar.gz" |
+        tar -xz -C "$tmp" --strip-components=1
+    sh "$tmp/install.sh" "$@" < /dev/tty
+    exit
+fi
+
 if ! python3 - <<'PY' 2>/dev/null
 import sys
 assert sys.version_info >= (3, 11)
@@ -41,15 +56,8 @@ fi
 
 say "Installing the app to $DEST"
 mkdir -p "$DEST" "$APPS" "$BIN"
-if [ -f "$SRC/kitty-styler.py" ]; then
-    install -m 755 "$SRC/kitty-styler.py" "$DEST/"
-else
-    # run through curl | sh: the app is one file, so fetch only that
-    curl -fsSL -o "$DEST/kitty-styler.py.part" \
-        https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/kitty-styler.py
-    chmod 755 "$DEST/kitty-styler.py.part"
-    mv "$DEST/kitty-styler.py.part" "$DEST/kitty-styler.py"
-fi
+install -m 644 "$SRC/updater.py" "$DEST/"
+install -m 755 "$SRC/kitty-styler.py" "$DEST/"
 ln -sf "$DEST/kitty-styler.py" "$BIN/$NAME"
 
 # named after the app ID so docks and taskbars match the window to this launcher;

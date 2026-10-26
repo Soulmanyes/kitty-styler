@@ -75,6 +75,9 @@ Every change shows up in a live preview before anything is written.
   end. It makes a one-time backup, `.zshrc.bak-kitty-styler`, and checks the result with `zsh -n` first.
   Changes apply in new shells (or `exec zsh`). Setting everything back removes both blocks.
 
+- **Update settings**: the auto-update switch and the last check are kept in
+  `~/.config/kitty-styler/updates.json`.
+
 Symlinked config files (from a dotfile manager) are written through the link.
 
 ## Requirements
@@ -115,10 +118,10 @@ no password needed, but `~/.local/bin` must be on your `PATH`. Nothing is bundle
 curl -fsSL https://raw.githubusercontent.com/Soulmanyes/kitty-styler/main/install.sh | sh
 ```
 
-This copies the app to `~/.local/share/kitty-styler`, adds **Kitty Styler** to your app menu and a
-`kitty-styler` command to `~/.local/bin`, then offers to install the [extras](#extras) that are missing.
-Run the same command again to update. Or clone the repository
-and run the script from it:
+This installs the latest release: it copies the app to `~/.local/share/kitty-styler`, adds **Kitty
+Styler** to your app menu and a `kitty-styler` command to `~/.local/bin`, then offers to install the
+[extras](#extras) that are missing. Run the same command again to update, or let the app do it (see
+[Updates](#updates)). Or clone the repository and run the script from it:
 
 ```sh
 git clone https://github.com/Soulmanyes/kitty-styler.git
@@ -127,6 +130,15 @@ cd kitty-styler
 ```
 
 You can also run it straight from the clone, without installing: `python3 kitty-styler.py`.
+
+### Updates
+
+Once a day the app asks GitHub for the latest release. When there is a newer one, a banner offers
+**Update**, which downloads it and runs its installer; restart the app to use it. Turn on **Install
+updates automatically** (at the bottom of the options) to skip the banner. A copy running from a git
+clone only tells you about the update.
+
+### Uninstall
 
 To remove it (your kitty config stays as it is):
 
@@ -164,3 +176,4 @@ CachyOS's fish 4.9 prompt and bash. fish's Tide prompt is not tested.
 [CC0 1.0](LICENSE): no rights reserved. Themes are not included; they are read from kitty's own download at
 runtime. The [extras](#extras) are installed from their own packages or releases, never bundled.
 oh-my-zsh plugin descriptions and aliases are read from your own oh-my-zsh install, never bundled.
+Besides those downloads, the only connection the app makes is the daily update check to GitHub.

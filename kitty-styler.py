@@ -29,6 +29,14 @@ gi.require_version("GdkPixbuf", "2.0")
 warnings.filterwarnings("ignore", ".*cairo_set_source_pixbuf", DeprecationWarning)
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
+# updater.py sits next to this file (the command in ~/.local/bin is a symlink). A copy of
+# kitty-styler.py on its own still runs, just without the Updates section.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import updater
+except ImportError:
+    updater = None
+
 KITTY_DIR = os.environ.get("KITTY_STYLER_DIR", os.path.expanduser("~/.config/kitty"))
 CONF = os.path.join(KITTY_DIR, "kitty.conf")
 NOCTALIA_THEME = os.path.join(KITTY_DIR, "themes", "noctalia.conf")
@@ -57,6 +65,10 @@ BLOCK_END = "# END_KITTY_STYLER"
 NOCTALIA = os.path.exists(NOCTALIA_THEME)
 BASE_LABEL = "Noctalia (follows wallpaper)" if NOCTALIA else "Keep current theme"
 APP_ID = "io.github.soulmanyes.KittyStyler"
+VERSION = "1.0.0"
+REPO = "Soulmanyes/kitty-styler"
+UPDATE_STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                            "kitty-styler", "updates.json")
 
 KITTY_COLORS = {
     "foreground": "#dddddd", "background": "#000000",
@@ -463,6 +475,7 @@ CSS = """
 .plugin-card { background: alpha(@theme_fg_color, 0.07); border: 1px solid alpha(@theme_fg_color, 0.3);
                border-radius: 8px; padding: 8px 10px; margin: 4px 8px; }
 .plugin-card:disabled { opacity: 0.6; }
+.update-banner { background: alpha(@accent_bg_color, 0.25); border-bottom: 1px solid alpha(@theme_fg_color, 0.3); }
 """
 
 
@@ -1529,6 +1542,9 @@ class StylerWindow(Gtk.ApplicationWindow):
                 row += 1
         self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, selectable=True)
         grid.attach(self.status, 0, row, 2, 1)
+        row += 1
+        if updater:
+            row = self.add_update_rows(grid, row)
 
         side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=440, hexpand=False)
         side.set_child(grid)
@@ -1536,15 +1552,147 @@ class StylerWindow(Gtk.ApplicationWindow):
         self.preview.cursor = Cursor()
         overlay = Gtk.Overlay(child=self.preview)
         overlay.add_overlay(self.preview.cursor)
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
         box.append(side)
         box.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         box.append(overlay)
-        self.set_child(box)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(self.make_update_banner())
+        outer.append(box)
+        self.set_child(outer)
 
         self.blink_id = None
         self.sync_dropdowns()
         self.ensure_render()
+        if updater:
+            self.check_update()
+
+    # ---- updates ----
+    def make_update_banner(self):
+        """'vX is available' with an Update button, across the top of the window."""
+        self.update_banner = Gtk.Revealer()
+        box = Gtk.Box(spacing=12, css_classes=["update-banner"])
+        self.update_banner_label = Gtk.Label(hexpand=True, wrap=True, margin_top=8, margin_bottom=8,
+                                             margin_start=12)
+        btn = Gtk.Button(label="Update", valign=Gtk.Align.CENTER, margin_end=12)
+        btn.add_css_class("suggested-action")
+        btn.connect("clicked", lambda _b: self.install_update())
+        box.append(self.update_banner_label)
+        box.append(btn)
+        self.update_banner.set_child(box)
+        return self.update_banner
+
+    def add_update_rows(self, grid, row):
+        self.updates = updater.Updater(REPO, VERSION, os.path.dirname(os.path.realpath(__file__)),
+                                       UPDATE_STATE)
+        self.latest = None       # a newer release, once the check finds one
+        self.installing = False
+        self.installed = False   # installed, by this window or an earlier one; a restart starts it
+        head = Gtk.Label(label="Updates", xalign=0, margin_top=12)
+        head.add_css_class("heading")
+        grid.attach(head, 0, row, 2, 1)
+        row += 1
+        grid.attach(Gtk.Label(label="Install updates automatically", xalign=0), 0, row, 1, 1)
+        self.auto_update_switch = Gtk.Switch(active=self.updates.auto, halign=Gtk.Align.START,
+                                             valign=Gtk.Align.CENTER)
+        self.auto_update_switch.connect("notify::active", self.on_auto_update)
+        grid.attach(self.auto_update_switch, 1, row, 1, 1)
+        row += 1
+        note = Gtk.Label(label="Off: the app tells you about a new version and waits for you to press "
+                               "Update. Checks GitHub once a day.", xalign=0, wrap=True, max_width_chars=34)
+        note.add_css_class("dim-label")
+        grid.attach(note, 0, row, 2, 1)
+        row += 1
+        grid.attach(Gtk.Label(label=f"Version {VERSION}", xalign=0), 0, row, 1, 1)
+        self.check_btn = Gtk.Button(label="Check now", halign=Gtk.Align.START)
+        self.check_btn.connect("clicked", lambda _b: self.check_update(force=True))
+        self.restart_btn = Gtk.Button(label="Restart", halign=Gtk.Align.START, visible=False)
+        self.restart_btn.add_css_class("suggested-action")
+        self.restart_btn.connect("clicked", lambda _b: os.execv(
+            sys.executable, [sys.executable, os.path.realpath(__file__)]))
+        buttons = Gtk.Box(spacing=8)
+        buttons.append(self.check_btn)
+        buttons.append(self.restart_btn)
+        grid.attach(buttons, 1, row, 1, 1)
+        row += 1
+        self.update_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=34)
+        self.update_note.add_css_class("dim-label")
+        grid.attach(self.update_note, 0, row, 2, 1)
+        return row + 1
+
+    def on_auto_update(self, switch, _pspec):
+        self.updates.auto = switch.get_active()
+        if self.updates.auto and self.latest and not self.updates.failed(self.latest):
+            self.install_update()
+
+    def show_installed(self, tag):
+        self.installed = True
+        self.update_banner.set_reveal_child(False)
+        self.update_note.set_label(f"{tag} installed. Restart to use it; changes not applied yet are lost.")
+        self.check_btn.set_visible(False)
+        self.restart_btn.set_visible(True)
+
+    def check_update(self, force=False):
+        if self.installing or self.installed:
+            return
+        self.update_note.set_label("Checking…")
+
+        def work():
+            try:
+                latest, error = self.updates.check(force), None
+            except (OSError, ValueError, KeyError) as e:  # offline, GitHub down, odd reply
+                latest, error = None, e
+            GLib.idle_add(found, latest, error)
+
+        def found(latest, error):
+            self.latest = latest
+            if error:
+                # only a check you asked for complains; the daily one stays quiet offline
+                self.update_note.set_label("Couldn't reach GitHub." if force else "")
+            elif not latest:
+                self.update_note.set_label("Up to date.")
+            elif self.updates.installed(latest):
+                self.show_installed(latest["tag"])
+            else:
+                self.update_note.set_label(f"{latest['tag']} is available.")
+                if self.updates.auto and not self.updates.dev_checkout \
+                        and not self.updates.failed(latest):
+                    self.install_update()
+                else:
+                    self.update_banner_label.set_label(f"Kitty Styler {latest['tag']} is available")
+                    self.update_banner.set_reveal_child(True)
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def install_update(self):
+        if self.installing or self.installed or not self.latest:
+            return
+        if self.updates.dev_checkout:
+            self.status.set_label("Running from a git checkout: update it with git pull.")
+            return
+        latest = self.latest
+        self.installing = True
+        self.update_banner.set_reveal_child(False)
+        self.update_note.set_label(f"Installing {latest['tag']}…")
+
+        def work():
+            try:
+                self.updates.install(latest)
+                error = None
+            except (OSError, RuntimeError) as e:  # network, disk, installer: shown to the user
+                error = str(e)
+            GLib.idle_add(finished, error)
+
+        def finished(error):
+            self.installing = False
+            if error:
+                self.update_note.set_label(f"Couldn't update: {error}")
+                return False
+            self.show_installed(latest["tag"])
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---- state ----
     def load_current(self):
