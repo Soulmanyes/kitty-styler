@@ -1261,6 +1261,19 @@ def toml_file(path):
         return {}
 
 
+def hidden_system_config(user_conf, names):
+    """A system-wide config a new user config would hide (the terminal loads only the first it finds),
+    if it sets anything; None when the user config exists or there is none to hide."""
+    if os.path.exists(user_conf):
+        return None
+    dirs = [d for d in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":") if d]
+    for path in [os.path.join(d, n) for d in dirs for n in names] + ["/etc/" + names[0]]:
+        # Section headers alone ([main], [colors]) set nothing; foot's example file is only those and comments.
+        if any(line.strip() and not line.lstrip().startswith(("#", "[")) for line in read(path).splitlines()):
+            return path
+    return None
+
+
 def hex_color(value):
     """#rrggbb for "#RRGGBB" or "0xRRGGBB"; None for anything else."""
     m = re.fullmatch(r"(?:#|0x)([0-9a-fA-F]{6})", str(value).strip())
@@ -1534,6 +1547,10 @@ class AlacrittyTerminal:
         return saved
 
     def write(self, s, themes, file_conf):
+        hidden = hidden_system_config(self.conf, ["alacritty/alacritty.toml", "alacritty.toml"])
+        if hidden:
+            raise OSError(f"no {self.conf} yet, and creating one would hide {hidden}: "
+                          "copy that file there first")
         text = read(self.conf)
         lines = text.splitlines()
         before = tomllib.loads(text) if text else {}
@@ -1803,6 +1820,10 @@ class FootTerminal:
         return kitty_shell(self.read_conf())
 
     def write(self, s, themes, file_conf):
+        hidden = hidden_system_config(self.conf, ["foot/foot.ini"])
+        if hidden:
+            raise OSError(f"no {self.conf} yet, and creating one would hide {hidden}: "
+                          "copy that file there first")
         text = read(self.conf)
         lines, block, in_block = [], {}, False
         for line in text.splitlines():
@@ -2180,16 +2201,41 @@ class GhosttyTerminal:
         return backup
 
     def reload(self):
-        """Like Noctalia's reload hook: the systemd unit, then the D-Bus action of a single instance."""
-        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 10}
-        try:
-            subprocess.run(["systemctl", "--user", "reload", "app-com.mitchellh.ghostty.service"],
-                           check=False, **quiet)
-            subprocess.run(["gdbus", "call", "--session", "--dest", "com.mitchellh.ghostty", "--object-path",
-                            "/com/mitchellh/ghostty", "--method", "org.gtk.Actions.Activate", "reload-config",
-                            "[]", "{}"], check=False, **quiet)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        """Like Noctalia's reload hook: the systemd unit's process, then the single-instance process on
+        D-Bus, then SIGUSR2 to every other Ghostty process (windows started with gtk-single-instance=false)."""
+        def run(*cmd):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+
+        done = set()
+        r = run("systemctl", "--user", "show", "--property=MainPID", "--value", "app-com.mitchellh.ghostty.service")
+        pid = r.stdout.strip() if r else ""
+        if pid.isdigit() and pid != "0":
+            r = run("systemctl", "--user", "reload", "app-com.mitchellh.ghostty.service")
+            if r and r.returncode == 0:
+                done.add(int(pid))
+        r = run("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
+                "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID", "com.mitchellh.ghostty")
+        m = re.match(r"\(uint32 (\d+),\)", r.stdout.strip()) if r else None
+        if m and int(m.group(1)) not in done:
+            r = run("gdbus", "call", "--session", "--dest", "com.mitchellh.ghostty", "--object-path",
+                    "/com/mitchellh/ghostty", "--method", "org.gtk.Actions.Activate", "reload-config", "[]", "{}")
+            if r and r.returncode == 0:
+                done.add(int(m.group(1)))
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit() or int(entry) in done or int(entry) == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    argv0 = f.read().split(b"\0", 1)[0].decode(errors="replace")
+                # Matched on the program name, so a shell whose command line mentions ghostty is left alone.
+                if os.path.basename(argv0) in ("ghostty", ".ghostty-wrapped") \
+                        and os.stat(f"/proc/{entry}").st_uid == os.getuid():
+                    os.kill(int(entry), signal.SIGUSR2)
+            except OSError:
+                continue
 
 
 def default_colors(fg, bg, palette):
@@ -5042,7 +5088,7 @@ def try_in_kitty(settings, colors, themes=None):
                 os.symlink(real, os.path.join(zdot, name))
         with open(os.path.join(tmp, "try.json"), "w", encoding="utf-8") as f:
             json.dump({"settings": settings, "colors": colors, "themes": themes or {}}, f)
-        env = dict(os.environ, KITTY_STYLER_SHELL=KITTY_SHELL or "", **paths)
+        env = dict(os.environ, KITTY_STYLER_SHELL=KITTY_SHELL or "", KITTY_STYLER_TERMINAL="kitty", **paths)
         r = subprocess.run([sys.executable, os.path.realpath(__file__), "--try", tmp], env=env,
                            capture_output=True, text=True, timeout=60, check=False)
         if r.returncode:
@@ -5076,6 +5122,9 @@ def try_in_kitty(settings, colors, themes=None):
 def try_apply(tmp):
     """The child process of try_in_kitty: Apply to the copies in tmp. Refuses any real path."""
     tmp = os.path.realpath(tmp)
+    if TERMINAL.name != "kitty":
+        print(f"refusing: the terminal is {TERMINAL.name}, not kitty", file=sys.stderr)
+        return 2
     for path in (CONF, STARSHIP_CONF, NOCTALIA_SETTINGS, *SHELL_RC.values()):
         if not os.path.realpath(path).startswith(tmp + os.sep):
             print(f"refusing: {path} is outside {tmp}", file=sys.stderr)
