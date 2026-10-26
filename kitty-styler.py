@@ -1922,7 +1922,8 @@ class ImportCheck(Gtk.Window):
             box.append(check)
         for name, why in installs:
             check = Gtk.CheckButton(label=f"Install {name}: {why}", active=True)
-            self.checks[name] = check
+            # Prefixed: the "starship" option (use their starship.toml) must not read as an install.
+            self.checks[f"install_{name}"] = check
             box.append(check)
         if installs:
             tip = Gtk.Label(label="Installing may ask for your password.", xalign=0)
@@ -2575,7 +2576,7 @@ class StylerWindow(Gtk.ApplicationWindow):
             values["shared_starship"] = text
         self.renders.pop("starship", None)
         self.render_gen += 1
-        installs = [name for name in chosen if name in EXTRAS]
+        installs = [name[len("install_"):] for name in chosen if name.startswith("install_")]
         self.settings.update(values)
         self.sync_dropdowns()
         self.ensure_render()
